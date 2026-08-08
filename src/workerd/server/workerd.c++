@@ -848,6 +848,8 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         .addOptionWithArg({"control-fd"}, CLI_METHOD(enableControl), "<fd>",
             "Enable sending of control messages on descriptor <fd>. Currently this "
             "only reports the port each socket is listening on when ready.")
+        .addOptionWithArg({"admin-fd"}, CLI_METHOD(enableAdmin), "<fd>",
+            "Serve privileged admin RPC over an already-connected Unix stream socket descriptor.")
         .addOptionWithArg({"debug-port"}, CLI_METHOD(enableDebugPort), "<addr>",
             "Listen on the specified address for debug RPC connections. This exposes "
             "a privileged interface that allows access to all services in the process. "
@@ -1070,6 +1072,24 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   }
 #endif
 
+  void validateAdminStream(kj::AsyncIoStream& stream) {
+    int socketType = 0;
+    uint socketTypeLength = sizeof(socketType);
+    sockaddr_storage peerAddress = {};
+    uint peerAddressLength = sizeof(peerAddress);
+
+    KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
+      stream.getsockopt(SOL_SOCKET, SO_TYPE, &socketType, &socketTypeLength);
+      stream.getpeername(reinterpret_cast<sockaddr*>(&peerAddress), &peerAddressLength);
+    })) {
+      CLI_ERROR("Admin value must be a connected Unix stream socket: ", exception.getDescription());
+    }
+
+    if (socketType != SOCK_STREAM || peerAddress.ss_family != AF_UNIX) {
+      CLI_ERROR("Admin value must be a connected Unix stream socket.");
+    }
+  }
+
   void overrideSocketFd(kj::StringPtr param) {
     auto [name, value] = parseOverride(param);
 
@@ -1109,6 +1129,31 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     int fd = KJ_UNWRAP_OR(param.tryParseAs<uint>(),
         CLI_ERROR("Output value must be a file descriptor (non-negative integer)."));
     server->enableControl(fd);
+  }
+
+  void enableAdmin(kj::StringPtr param) {
+    if (adminConfigured) {
+      CLI_ERROR("Admin RPC is already configured.");
+    }
+    if (watcher != kj::none) {
+      CLI_ERROR("--admin-fd cannot be combined with --watch.");
+    }
+
+    int fd = KJ_UNWRAP_OR(param.tryParseAs<int>(),
+        CLI_ERROR("Admin value must be a file descriptor (non-negative integer)."));
+    if (fd < 0) {
+      CLI_ERROR("Admin value must be a file descriptor (non-negative integer).");
+    }
+
+    kj::Own<kj::AsyncIoStream> stream;
+    KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
+      stream = io.lowLevelProvider->wrapSocketFd(fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+    })) {
+      CLI_ERROR("Admin value must be a connected Unix stream socket: ", exception.getDescription());
+    }
+    validateAdminStream(*stream);
+    server->enableAdmin(kj::mv(stream));
+    adminConfigured = true;
   }
 
   void enableDebugPort(kj::StringPtr param) {
@@ -1159,6 +1204,10 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   }
 
   void watch() {
+    if (adminConfigured) {
+      CLI_ERROR("--watch cannot be combined with --admin-fd.");
+    }
+
 #if _WIN32
     auto& w = watcher.emplace(io.win32EventPort);
 #else
@@ -1563,6 +1612,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   bool predictable = false;
   bool gcStress = false;
   bool allAutogates = false;
+  bool adminConfigured = false;
   kj::Maybe<kj::String> testCompatDate;
   kj::Maybe<FileWatcher> watcher;
 
