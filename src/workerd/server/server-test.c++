@@ -6,6 +6,7 @@
 
 #include <workerd/jsg/jsg-test.h>
 #include <workerd/jsg/setup.h>
+#include <workerd/server/workerd-admin.capnp.h>
 #include <workerd/util/autogate.h>
 #include <workerd/util/capnp-mock.h>
 
@@ -766,6 +767,52 @@ KJ_TEST("Server: worker router requires a dispatch header") {
     Service named "missing" has no worker router dispatch header.
     Service named "empty" has no worker router dispatch header.
   )"_blockquote);
+}
+
+KJ_TEST("Server: admin RPC reports worker service count") {
+  TestServer test(R"((
+    services = [
+      ( name = "first",
+        worker = (
+          compatibilityDate = "2022-08-17",
+          serviceWorkerScript =
+              `addEventListener("fetch", event => {
+              `  event.respondWith(new Response("alive"));
+              `})
+        )
+      ),
+      ( name = "second",
+        worker = (
+          compatibilityDate = "2022-08-17",
+          serviceWorkerScript =
+              `addEventListener("fetch", event => {
+              `  event.respondWith(new Response("second"));
+              `})
+        )
+      )
+    ],
+    sockets = [
+      (name = "main", address = "test-addr", service = "first")
+    ]
+  ))"_kj);
+
+  auto pipe = kj::newTwoWayPipe();
+  test.server.enableAdmin(kj::mv(pipe.ends[0]));
+  test.start();
+
+  {
+    auto clientStream = kj::mv(pipe.ends[1]);
+    capnp::TwoPartyClient client(*clientStream);
+    auto adminClient = client.bootstrap().castAs<admin::WorkerdAdmin>();
+
+    auto first = adminClient.statsRequest().send().wait(test.ws);
+    KJ_EXPECT(first.getWorkerServiceCount() == 2);
+    auto second = adminClient.statsRequest().send().wait(test.ws);
+    KJ_EXPECT(second.getWorkerServiceCount() == 2);
+  }
+
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "alive");
 }
 
 KJ_TEST("Server: serve Service Worker using the new module registry") {
