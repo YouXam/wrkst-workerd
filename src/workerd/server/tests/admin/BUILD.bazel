@@ -1,0 +1,16 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "admin-fd-test",
+    srcs = ["admin-fd-test.py"],
+    args = [
+        "$(location //src/workerd/server:workerd)",
+        "$(location //samples:helloworld/config.capnp)",
+    ],
+    data = [
+        "//samples:helloworld/config.capnp",
+        "//samples:helloworld/worker.js",
+        "//src/workerd/server:workerd",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+)

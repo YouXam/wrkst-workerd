@@ -231,6 +231,7 @@ wd_cc_library(
         ":container-client",
         ":facet-tree-index",
         ":fallback-service",
+        ":workerd-admin_capnp",
         ":workerd-api",
         ":workerd_capnp",
         "//src/cloudflare",
@@ -250,6 +251,8 @@ wd_cc_library(
 )
 
 wd_capnp_library(src = "docker-api.capnp")
+
+wd_capnp_library(src = "workerd-admin.capnp")
 
 wd_capnp_library(src = "log-schema.capnp")
 
@@ -356,6 +359,7 @@ kj_test(
     src = "server-test.c++",
     deps = [
         ":server",
+        ":workerd-admin_capnp",
         "//src/workerd/util:test-util",
     ],
 )
