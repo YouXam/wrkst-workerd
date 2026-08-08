@@ -4589,6 +4589,117 @@ class Server::WorkerService final: public Service,
   }
 };
 
+class Server::WorkerRouterService final: public Service {
+ public:
+  WorkerRouterService(Server& server,
+      kj::String servicePrefix,
+      kj::HttpHeaderId dispatchHeader,
+      kj::HttpHeaderTable& headerTable)
+      : server(server),
+        servicePrefix(kj::mv(servicePrefix)),
+        dispatchHeader(dispatchHeader),
+        headerTable(headerTable) {}
+
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    return kj::heap<Request>(*this, kj::mv(metadata));
+  }
+
+  bool hasHandler(kj::StringPtr handlerName) override {
+    return handlerName == "fetch"_kj || handlerName == "connect"_kj;
+  }
+
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+      IoChannelFactory::ChannelTokenUsage usage) override {
+    JSG_FAIL_REQUIRE(DOMDataCloneError, "WorkerRouterService can't be passed over RPC.");
+  }
+
+ private:
+  class Request final: public WorkerInterface {
+   public:
+    Request(WorkerRouterService& parent, IoChannelFactory::SubrequestMetadata metadata)
+        : parent(parent),
+          metadata(kj::mv(metadata)) {}
+
+    kj::Promise<void> request(kj::HttpMethod method,
+        kj::StringPtr url,
+        const kj::HttpHeaders& headers,
+        kj::AsyncInputStream& requestBody,
+        kj::HttpService::Response& response) override {
+      auto& worker = KJ_UNWRAP_OR(parent.findWorker(headers), {
+        co_return co_await response.sendError(503, "Service Unavailable", parent.headerTable);
+      });
+      auto forwardedHeaders = parent.removeDispatchHeader(headers);
+      auto inner = worker.startRequest(kj::mv(metadata));
+      co_await inner->request(method, url, forwardedHeaders, requestBody, response);
+    }
+
+    kj::Promise<void> connect(kj::StringPtr host,
+        const kj::HttpHeaders& headers,
+        kj::AsyncIoStream& connection,
+        ConnectResponse& response,
+        kj::HttpConnectSettings settings) override {
+      auto& worker = KJ_UNWRAP_OR(parent.findWorker(headers), {
+        response.reject(503, "Service Unavailable", kj::HttpHeaders(parent.headerTable),
+            static_cast<uint64_t>(0));
+        co_return;
+      });
+      auto forwardedHeaders = parent.removeDispatchHeader(headers);
+      auto inner = worker.startRequest(kj::mv(metadata));
+      co_await inner->connect(host, forwardedHeaders, connection, response, kj::mv(settings));
+    }
+
+    kj::Promise<void> prewarm(kj::StringPtr url) override {
+      return kj::READY_NOW;
+    }
+
+    kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
+      throwUnsupported();
+    }
+
+    kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
+      throwUnsupported();
+    }
+
+    kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
+      return event->notSupported();
+    }
+
+   private:
+    WorkerRouterService& parent;
+    IoChannelFactory::SubrequestMetadata metadata;
+
+    [[noreturn]] void throwUnsupported() {
+      JSG_FAIL_REQUIRE(Error, "Worker routers don't support this event type.");
+    }
+  };
+
+  Server& server;
+  kj::String servicePrefix;
+  kj::HttpHeaderId dispatchHeader;
+  kj::HttpHeaderTable& headerTable;
+
+  kj::Maybe<WorkerService&> findWorker(const kj::HttpHeaders& headers) {
+    KJ_IF_SOME(serviceSuffix, headers.get(dispatchHeader)) {
+      if (serviceSuffix.size() == 0) return kj::none;
+
+      auto serviceName = kj::str(servicePrefix, serviceSuffix);
+      KJ_IF_SOME(service, server.services.find(serviceName)) {
+        return kj::tryDowncast<WorkerService>(*service);
+      }
+    }
+    return kj::none;
+  }
+
+  kj::HttpHeaders removeDispatchHeader(const kj::HttpHeaders& headers) {
+    kj::HttpHeaders result(headerTable);
+    auto dispatchHeaderName = dispatchHeader.toString();
+    headers.forEach([&](kj::StringPtr name, kj::StringPtr value) {
+      if (!strcaseeq(name, dispatchHeaderName)) result.addPtrPtr(name, value);
+    });
+    return result;
+  }
+};
+
 struct FutureSubrequestChannel {
   kj::OneOf<config::ServiceDesignator::Reader, kj::Own<IoChannelFactory::SubrequestChannel>>
       designator;
@@ -6086,6 +6197,17 @@ kj::Promise<kj::Own<Server::Service>> Server::makeService(config::Service::Reade
 
     case config::Service::DISK:
       co_return makeDiskDirectoryService(name, conf.getDisk(), headerTableBuilder);
+
+    case config::Service::WORKER_ROUTER: {
+      auto router = conf.getWorkerRouter();
+      if (!router.hasHeader() || router.getHeader().size() == 0) {
+        reportConfigError(
+            kj::str("Service named \"", name, "\" has no worker router dispatch header."));
+        co_return makeInvalidConfigService();
+      }
+      co_return kj::refcounted<WorkerRouterService>(*this, kj::str(router.getServicePrefix()),
+          headerTableBuilder.add(router.getHeader()), headerTableBuilder.getFutureTable());
+    }
   }
 
   reportConfigError(kj::str("Service named \"", name,
