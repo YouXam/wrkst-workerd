@@ -320,6 +320,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   class NetworkService;
   class DiskDirectoryService;
   class WorkerService;
+  class WorkerRouterService;
   class WorkerEntrypointService;
   class WorkerdBootstrapImpl;
   class HttpListener;
