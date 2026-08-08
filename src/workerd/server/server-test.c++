@@ -668,6 +668,106 @@ KJ_TEST("Server: serve basic Service Worker") {
     Bad Request)"_blockquote);
 }
 
+KJ_TEST("Server: worker router dispatches by header") {
+  TestServer test(R"((
+    services = [
+      ( name = "tenant/Alpha_Worker@canary",
+        worker = (
+          compatibilityDate = "2022-08-17",
+          serviceWorkerScript =
+              `addEventListener("fetch", event => {
+              `  const leaked = event.request.headers.has("x-worker-route") ||
+              `      event.request.headers.has("set-cookie");
+              `  event.respondWith(new Response(leaked ? "header leaked" : "alpha"));
+              `})
+        )
+      ),
+      ( name = "tenant/beta-route",
+        worker = (
+          compatibilityDate = "2022-08-17",
+          serviceWorkerScript =
+              `addEventListener("fetch", event => {
+              `  const leaked = event.request.headers.has("x-worker-route");
+              `  event.respondWith(new Response(leaked ? "header leaked" : "beta"));
+              `})
+        )
+      ),
+      ( name = "tenant/system-route",
+        network = (allow = ["public"])
+      ),
+      ( name = "ingress",
+        workerRouter = (header = "X-Worker-Route", servicePrefix = "tenant/")
+      ),
+      ( name = "cookie-ingress",
+        workerRouter = (header = "Set-Cookie", servicePrefix = "tenant/")
+      )
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "ingress"
+      ),
+      ( name = "cookie",
+        address = "cookie-addr",
+        service = "cookie-ingress"
+      )
+    ]
+  ))"_kj);
+
+  test.start();
+
+  auto expectWorker = [&](kj::StringPtr routeKey, kj::StringPtr expected) {
+    auto conn = test.connect("test-addr");
+    conn.send(kj::str("GET / HTTP/1.1\nHost: example.com\nX-Worker-Route: ", routeKey, "\n\n"));
+    conn.recvHttp200(expected);
+  };
+  auto expectUnavailable = [&](kj::Maybe<kj::StringPtr> routeKey) {
+    auto conn = test.connect("test-addr");
+    KJ_IF_SOME(key, routeKey) {
+      conn.send(kj::str("GET / HTTP/1.1\nHost: example.com\nX-Worker-Route: ", key, "\n\n"));
+    } else {
+      conn.sendHttpGet("/");
+    }
+    conn.recv(R"(
+      HTTP/1.1 503 Service Unavailable
+      Content-Length: 19
+
+      Service Unavailable)"_blockquote);
+  };
+
+  expectWorker("Alpha_Worker@canary", "alpha");
+  expectWorker("beta-route", "beta");
+
+  auto duplicateHeader = test.connect("cookie-addr");
+  duplicateHeader.send(R"(
+    GET / HTTP/1.1
+    Host: example.com
+    Set-Cookie: Alpha_Worker@canary
+    Set-Cookie: must-not-leak
+
+  )"_blockquote);
+  duplicateHeader.recvHttp200("alpha");
+
+  expectUnavailable(kj::none);
+  expectUnavailable("../internet"_kj);
+  expectUnavailable("missing"_kj);
+  expectUnavailable("system-route"_kj);
+}
+
+KJ_TEST("Server: worker router requires a dispatch header") {
+  TestServer test(R"((
+    services = [
+      (name = "missing", workerRouter = ()),
+      (name = "empty", workerRouter = (header = "")),
+    ]
+  ))"_kj);
+
+  test.expectErrors(R"(
+    Service named "missing" has no worker router dispatch header.
+    Service named "empty" has no worker router dispatch header.
+  )"_blockquote);
+}
+
 KJ_TEST("Server: serve Service Worker using the new module registry") {
   TestServer test(singleWorker(R"((
     compatibilityDate = "2022-08-17",
