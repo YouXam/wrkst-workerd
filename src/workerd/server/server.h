@@ -69,6 +69,10 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   void enableControl(uint fd) {
     controlOverride = kj::heap<kj::FdOutputStream>(fd);
   }
+  void enableAdmin(kj::Own<kj::AsyncIoStream> stream) {
+    KJ_REQUIRE(adminOverride.get() == nullptr, "Admin stream is already configured.");
+    adminOverride = kj::mv(stream);
+  }
   void enableDebugPort(kj::String addr) {
     debugPortOverride = kj::mv(addr);
   }
@@ -176,6 +180,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   kj::Maybe<kj::String> inspectorOverride;
   kj::Maybe<kj::Own<InspectorServiceIsolateRegistrar>> inspectorIsolateRegistrar;
   kj::Maybe<kj::Own<kj::FdOutputStream>> controlOverride;
+  kj::Own<kj::AsyncIoStream> adminOverride;
   kj::Maybe<kj::String> debugPortOverride;
 
   struct GlobalContext;
@@ -321,12 +326,15 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   class DiskDirectoryService;
   class WorkerService;
   class WorkerRouterService;
+  class AdminService;
   class WorkerEntrypointService;
   class WorkerdBootstrapImpl;
   class HttpListener;
   class TcpListener;
   class DebugPortListener;
   class WorkerdDebugPortImpl;
+
+  kj::Own<AdminService> adminService;
 
   struct ErrorReporter;
   struct ConfigErrorReporter;

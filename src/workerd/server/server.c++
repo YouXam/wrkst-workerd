@@ -34,6 +34,7 @@
 #include <workerd/server/actor-id-impl.h>
 #include <workerd/server/facet-tree-index.h>
 #include <workerd/server/fallback-service.h>
+#include <workerd/server/workerd-admin.capnp.h>
 #include <workerd/util/exception.h>
 #include <workerd/util/http-util.h>
 #include <workerd/util/mimetype.h>
@@ -338,6 +339,7 @@ Server::~Server() noexcept {
   // work, which we can cancel by aborting them.
   abortAllActors(KJ_EXCEPTION(DISCONNECTED, "Server shutting down."));
   tasks.clear();
+  adminService = nullptr;
 
   // Unlink all the services, which should remove all refcount cycles.
   unlinkWorkerLoaders();
@@ -4700,6 +4702,35 @@ class Server::WorkerRouterService final: public Service {
   }
 };
 
+class Server::AdminService {
+  class Impl final: public admin::WorkerdAdmin::Server {
+   public:
+    Impl(workerd::server::Server& owner): owner(owner) {}
+
+    kj::Promise<void> stats(StatsContext context) override {
+      uint workerServiceCount = 0;
+      for (auto& service: owner.services) {
+        if (kj::tryDowncast<WorkerService>(*service.value) != kj::none) {
+          ++workerServiceCount;
+        }
+      }
+      context.getResults().setWorkerServiceCount(workerServiceCount);
+      return kj::READY_NOW;
+    }
+
+   private:
+    workerd::server::Server& owner;
+  };
+
+ public:
+  AdminService(Server& owner, kj::Own<kj::AsyncIoStream> stream): server(kj::heap<Impl>(owner)) {
+    server.accept(kj::mv(stream));
+  }
+
+ private:
+  capnp::TwoPartyServer server;
+};
+
 struct FutureSubrequestChannel {
   kj::OneOf<config::ServiceDesignator::Reader, kj::Own<IoChannelFactory::SubrequestChannel>>
       designator;
@@ -6965,6 +6996,10 @@ kj::Promise<void> Server::run(
   auto forkedDrainWhen = handleDrain(kj::mv(drainWhen)).fork();
 
   co_await startServices(v8System, config, headerTableBuilder, forkedDrainWhen);
+
+  if (adminOverride.get() != nullptr) {
+    adminService = kj::heap<AdminService>(*this, kj::mv(adminOverride));
+  }
 
   auto listenPromise = listenOnSockets(config, headerTableBuilder, forkedDrainWhen);
 
