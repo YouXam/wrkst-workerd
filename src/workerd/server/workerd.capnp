@@ -188,12 +188,23 @@ struct Service {
     # An HTTP service backed by a directory on disk, supporting a basic HTTP GET/PUT. Generally
     # not intended to be exposed directly to the internet; typically you want to bind this into
     # a Worker that adds logic for setting Content-Type and the like.
+
+    workerRouter @6 :WorkerRouter;
+    # An HTTP service that selects a Worker service using a request header.
   }
 
   # TODO(someday): Allow defining a list of middlewares to stack on top of the service. This would
   #   be a list of Worker names, where each Worker must have a binding called `next`. This
   #   implicitly creates an inherited worker that wraps this service, with the `next` binding
   #   pointing to the service itself (or to the next middleware in the stack).
+}
+
+struct WorkerRouter {
+  header @0 :Text;
+  # Header containing the target service suffix. The header is removed before dispatch.
+
+  servicePrefix @1 :Text;
+  # Optional prefix prepended to the header value. The target must be a Worker service.
 }
 
 struct ServiceDesignator {
