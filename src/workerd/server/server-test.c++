@@ -620,6 +620,84 @@ kj::String singleWorker(kj::StringPtr def) {
   ))"_kj);
 }
 
+struct AdminAddResult {
+  admin::AddWorkerResult::Which status;
+  kj::String message;
+};
+
+class TestAdminClient {
+ public:
+  TestAdminClient(TestServer& test): TestAdminClient(test, kj::newTwoWayPipe()) {}
+
+  uint stats() {
+    return client.statsRequest().send().wait(ws).getWorkerServiceCount();
+  }
+
+  template <typename Func>
+  AdminAddResult addWorker(
+      kj::StringPtr serviceName, kj::ArrayPtr<const byte> digest, Func&& buildWorker) {
+    auto request = client.addWorkerRequest();
+    request.setServiceName(serviceName);
+    request.setDigest(digest);
+    buildWorker(request.initWorker());
+    return decode(request.send().wait(ws).getResult());
+  }
+
+  admin::WorkerdAdmin::Client& getClient() {
+    return client;
+  }
+
+  static AdminAddResult decode(admin::AddWorkerResult::Reader result) {
+    switch (result.which()) {
+      case admin::AddWorkerResult::ADDED:
+      case admin::AddWorkerResult::ALREADY_LOADED:
+        return {result.which(), kj::str("")};
+      case admin::AddWorkerResult::RESTART_REQUIRED:
+        return {result.which(), kj::str(result.getRestartRequired())};
+      case admin::AddWorkerResult::ERROR:
+        return {result.which(), kj::str(result.getError())};
+    }
+    KJ_UNREACHABLE;
+  }
+
+ private:
+  TestAdminClient(TestServer& test, kj::TwoWayPipe pipe)
+      : ws(test.ws),
+        stream(kj::mv(pipe.ends[1])),
+        rpcClient(*stream),
+        client(rpcClient.bootstrap().castAs<admin::WorkerdAdmin>()) {
+    test.server.enableAdmin(kj::mv(pipe.ends[0]));
+  }
+
+  kj::WaitScope& ws;
+  kj::Own<kj::AsyncIoStream> stream;
+  capnp::TwoPartyClient rpcClient;
+  admin::WorkerdAdmin::Client client;
+};
+
+void initModuleWorker(config::Worker::Builder worker, kj::StringPtr source) {
+  worker.setCompatibilityDate("2024-10-01");
+  auto module = worker.initModules(1)[0];
+  module.setName("worker.js");
+  module.setEsModule(source);
+}
+
+void expectRouteUnavailable(TestServer& test, kj::StringPtr route) {
+  auto conn = test.connect("test-addr");
+  conn.send(kj::str("GET / HTTP/1.1\nHost: example.com\nX-Worker-Route: ", route, "\n\n"));
+  conn.recv(R"(
+    HTTP/1.1 503 Service Unavailable
+    Content-Length: 19
+
+    Service Unavailable)"_blockquote);
+}
+
+void expectRoute(TestServer& test, kj::StringPtr route, kj::StringPtr expected) {
+  auto conn = test.connect("test-addr");
+  conn.send(kj::str("GET / HTTP/1.1\nHost: example.com\nX-Worker-Route: ", route, "\n\n"));
+  conn.recvHttp200(expected);
+}
+
 KJ_TEST("Server: serve basic Service Worker") {
   TestServer test(singleWorker(R"((
     compatibilityDate = "2022-08-17",
@@ -806,6 +884,468 @@ KJ_TEST("Server: admin RPC reports worker service count") {
 
   auto conn = test.connect("test-addr");
   conn.httpGet200("/", "alive");
+}
+
+KJ_TEST("Server: admin RPC atomically adds routable workers with complete bindings") {
+  TestServer test(R"((
+    services = [
+      ( name = "backend",
+        worker = (
+          compatibilityDate = "2024-10-01",
+          modules = [
+            ( name = "worker.js",
+              esModule = `export default { fetch() { return new Response("static"); } }
+            )
+          ]
+        )
+      ),
+      ( name = "ingress",
+        workerRouter = (header = "X-Worker-Route", servicePrefix = "dynamic/")
+      )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+    extensions = [(
+      modules = [(
+        name = "test:wrapper",
+        internal = true,
+        esModule = `export default env => env;
+      )]
+    )]
+  ))"_kj);
+
+  TestAdminClient admin(test);
+  test.start();
+
+  KJ_EXPECT(admin.stats() == 1);
+  expectRouteUnavailable(test, "main");
+
+  auto prior =
+      admin.addWorker("dynamic/prior", "prior-digest"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('prior'); } }"_kj);
+  });
+  KJ_EXPECT(prior.status == admin::AddWorkerResult::ADDED);
+
+  auto added =
+      admin.addWorker("dynamic/main", "main-digest"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        async fetch(request, env) {
+          const fromStatic = await (await env.STATIC.fetch("http://placeholder")).text();
+          const fromPrior = await (await env.PRIOR.fetch("http://placeholder")).text();
+          return new Response([
+            env.TEXT,
+            env.JSON.value,
+            new Uint8Array(env.DATA)[0],
+            env.WRAPPED.label,
+            fromStatic,
+            fromPrior,
+            typeof env.SELF.fetch,
+          ].join(":"));
+        }
+      }
+    )"_kj);
+
+    auto bindings = worker.initBindings(7);
+    bindings[0].setName("TEXT");
+    bindings[0].setText("text");
+    bindings[1].setName("JSON");
+    bindings[1].setJson(R"({"value":"json"})");
+    bindings[2].setName("DATA");
+    const byte data = 7;
+    bindings[2].setData(kj::arrayPtr(data));
+    bindings[3].setName("STATIC");
+    bindings[3].initService().setName("backend");
+    bindings[4].setName("PRIOR");
+    bindings[4].initService().setName("dynamic/prior");
+    bindings[5].setName("SELF");
+    bindings[5].initService().setName("dynamic/main");
+    bindings[6].setName("WRAPPED");
+    auto wrapped = bindings[6].initWrapped();
+    wrapped.setModuleName("test:wrapper");
+    auto inner = wrapped.initInnerBindings(1)[0];
+    inner.setName("label");
+    inner.setText("wrapped");
+  });
+
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+  KJ_EXPECT(admin.stats() == 3);
+  expectRoute(test, "main", "text:json:7:wrapped:static:prior:function");
+}
+
+KJ_TEST("Server: dynamically added module sources outlive the admin request") {
+  TestServer test(R"((
+    services = [
+      (name = "ingress", workerRouter = (header = "X-Worker-Route", servicePrefix = "dynamic/"))
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")]
+  ))"_kj);
+  test.server.allowExperimental();
+  auto serviceWorkerName = "dynamic/service-worker"_kj;
+
+  {
+    TestAdminClient admin(test);
+    test.start();
+
+    auto added = admin.addWorker("dynamic/lazy", "lazy"_kjb, [](config::Worker::Builder worker) {
+      worker.setCompatibilityDate("2024-10-01");
+      worker.initCompatibilityFlags(1).set(0, "new_module_registry");
+      auto modules = worker.initModules(2);
+      modules[0].setName("worker.js");
+      modules[0].setEsModule(R"(
+        export default {
+          async fetch() {
+            const { value } = await import("./lazy.js");
+            return new Response(value);
+          }
+        }
+      )"_kj);
+      modules[1].setName("lazy.js");
+      modules[1].setEsModule(
+          kj::str("export const value = 'retained';\n//", kj::repeat('x', 512 * 1024)));
+    });
+    KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+
+    auto serviceWorker = admin.addWorker(
+        serviceWorkerName, "service-worker"_kjb, [](config::Worker::Builder worker) {
+      worker.setCompatibilityDate("2025-09-01");
+      auto flags = worker.initCompatibilityFlags(3);
+      flags.set(0, "nodejs_compat");
+      flags.set(1, "new_module_registry");
+      flags.set(2, "enable_nodejs_fs_module");
+      worker.setServiceWorkerScript(R"(
+        addEventListener("fetch", event => {
+          const fs = process.getBuiltinModule("node:fs");
+          event.respondWith(new Response(String(fs.existsSync("/bundle/dynamic/service-worker"))));
+        });
+      )"_kj);
+    });
+    KJ_EXPECT(serviceWorker.status == admin::AddWorkerResult::ADDED, serviceWorker.message);
+  }
+
+  kj::Vector<kj::Array<byte>> overwrittenRpcBuffers;
+  for (uint i = 0; i < 16; ++i) {
+    auto bytes = kj::heapArray<byte>(512 * 1024);
+    bytes.asPtr().fill(0xa5);
+    overwrittenRpcBuffers.add(kj::mv(bytes));
+  }
+  kj::Vector<kj::String> overwrittenServiceNames;
+  for (uint i = 0; i < 4096; ++i) {
+    overwrittenServiceNames.add(kj::str(kj::repeat('x', serviceWorkerName.size())));
+  }
+  expectRoute(test, "lazy", "retained");
+  expectRoute(test, "service-worker", "true");
+}
+
+KJ_TEST("Server: admin RPC rolls back failed worker construction and linking") {
+  TestServer test(R"((
+    services = [
+      (name = "ingress", workerRouter = (header = "X-Worker-Route", servicePrefix = "dynamic/"))
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")]
+  ))"_kj);
+
+  TestAdminClient admin(test);
+  test.server.allowExperimental();
+  test.start();
+
+  auto invalid =
+      admin.addWorker("dynamic/invalid", "invalid"_kjb, [](config::Worker::Builder worker) {
+    worker.setCompatibilityDate("2024-10-01");
+    auto modules = worker.initModules(2);
+    for (auto module: modules) {
+      module.setName("duplicate.js");
+      module.setEsModule("export default {};");
+    }
+  });
+  KJ_EXPECT(invalid.status == admin::AddWorkerResult::ERROR, invalid.message);
+  expectRouteUnavailable(test, "invalid");
+
+  auto invalidRetried =
+      admin.addWorker("dynamic/invalid", "fixed"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('fixed'); } }"_kj);
+  });
+  KJ_EXPECT(invalidRetried.status == admin::AddWorkerResult::ADDED, invalidRetried.message);
+  expectRoute(test, "invalid", "fixed");
+
+  auto unlinked =
+      admin.addWorker("dynamic/retry", "broken"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('ok'); } }"_kj);
+    auto binding = worker.initBindings(1)[0];
+    binding.setName("MISSING");
+    binding.initService().setName("does-not-exist");
+  });
+  KJ_EXPECT(unlinked.status == admin::AddWorkerResult::ERROR, unlinked.message);
+  expectRouteUnavailable(test, "retry");
+  KJ_EXPECT(admin.stats() == 1);
+
+  auto retried = admin.addWorker("dynamic/retry", "fixed"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('ok'); } }"_kj);
+  });
+  KJ_EXPECT(retried.status == admin::AddWorkerResult::ADDED, retried.message);
+  KJ_EXPECT(admin.stats() == 2);
+  expectRoute(test, "retry", "ok");
+}
+
+KJ_TEST("Server: admin RPC reports idempotent and restart-required additions") {
+  TestServer test(R"((
+    services = [
+      ( name = "static",
+        worker = (
+          compatibilityDate = "2024-10-01",
+          modules = [
+            (name = "worker.js", esModule = `export default {}
+            )
+          ]
+        )
+      ),
+      (name = "ingress", workerRouter = (header = "X-Worker-Route", servicePrefix = "dynamic/"))
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")]
+  ))"_kj);
+
+  TestAdminClient admin(test);
+  test.start();
+
+  auto added = admin.addWorker("dynamic/stable", "same"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('stable'); } }"_kj);
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED);
+
+  auto repeated = admin.addWorker("dynamic/stable", "same"_kjb, [](config::Worker::Builder) {});
+  KJ_EXPECT(repeated.status == admin::AddWorkerResult::ALREADY_LOADED);
+
+  auto changed = admin.addWorker("dynamic/stable", "different"_kjb, [](config::Worker::Builder) {});
+  KJ_EXPECT(changed.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  auto collision = admin.addWorker("static", "static"_kjb, [](config::Worker::Builder) {});
+  KJ_EXPECT(collision.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  auto durable =
+      admin.addWorker("dynamic/durable", "durable"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export class Counter {}"_kj);
+    auto ns = worker.initDurableObjectNamespaces(1)[0];
+    ns.setClassName("Counter");
+    ns.setUniqueKey("counter-key");
+    worker.getDurableObjectStorage().setInMemory();
+  });
+  KJ_EXPECT(durable.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  auto loader = admin.addWorker("dynamic/loader", "loader"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default {}"_kj);
+    auto binding = worker.initBindings(1)[0];
+    binding.setName("WRAPPED");
+    auto inner = binding.initWrapped().initInnerBindings(1)[0];
+    inner.setName("LOADER");
+    inner.initWorkerLoader().setId("shared-loader");
+  });
+  KJ_EXPECT(loader.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  auto access = admin.addWorker("dynamic/access", "access"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default {}"_kj);
+    worker.initAccessBindingService().setName("static");
+  });
+  KJ_EXPECT(access.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  KJ_EXPECT(admin.stats() == 2);
+  expectRoute(test, "stable", "stable");
+}
+
+KJ_TEST("Server: admin RPC enforces worker request boundaries") {
+  TestServer test(R"((
+    services = [(name = "ingress", workerRouter = (header = "X-Worker-Route"))],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")]
+  ))"_kj);
+  TestAdminClient admin(test);
+  test.start();
+
+  auto emptyName = admin.addWorker("", "digest"_kjb, [](config::Worker::Builder) {});
+  KJ_EXPECT(emptyName.status == admin::AddWorkerResult::ERROR);
+  auto longName = kj::str(kj::repeat('x', 1025));
+  auto oversizedName = admin.addWorker(longName, "digest"_kjb, [](config::Worker::Builder) {});
+  KJ_EXPECT(oversizedName.status == admin::AddWorkerResult::ERROR);
+  KJ_EXPECT(oversizedName.message == "serviceName must contain between 1 and 1024 bytes.");
+  auto emptyDigest = admin.addWorker("dynamic/empty", nullptr, [](config::Worker::Builder) {});
+  KJ_EXPECT(emptyDigest.status == admin::AddWorkerResult::ERROR);
+  auto longDigestBytes = kj::heapArray<byte>(65);
+  longDigestBytes.asPtr().fill(1);
+  auto longDigest =
+      admin.addWorker("dynamic/long", longDigestBytes, [](config::Worker::Builder) {});
+  KJ_EXPECT(longDigest.status == admin::AddWorkerResult::ERROR);
+
+  auto boundedErrors =
+      admin.addWorker("dynamic/errors", "errors"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('ok'); } }"_kj);
+    auto bindings = worker.initBindings(65);
+    for (auto binding: bindings) {
+      binding.setName("INVALID");
+    }
+  });
+  KJ_EXPECT(boundedErrors.status == admin::AddWorkerResult::ERROR);
+  KJ_EXPECT(
+      boundedErrors.message.endsWith("Validation stopped after 64 errors."), boundedErrors.message);
+
+  auto boundedWrappedErrors = admin.addWorker(
+      "dynamic/wrapped-errors", "wrapped-errors"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('ok'); } }"_kj);
+    auto binding = worker.initBindings(1)[0];
+    binding.setName("WRAPPED");
+    auto wrapped = binding.initWrapped();
+    wrapped.setModuleName("test:unused");
+    auto innerBindings = wrapped.initInnerBindings(65);
+    for (auto i: kj::zeroTo(64)) {
+      innerBindings[i].setName("INVALID");
+      auto key = innerBindings[i].initCryptoKey();
+      key.setHex("not-hex");
+      key.getAlgorithm().setName("AES-GCM");
+    }
+    innerBindings[64].setName("STOP");
+    innerBindings[64].initParameter();
+  });
+  KJ_EXPECT(boundedWrappedErrors.status == admin::AddWorkerResult::ERROR);
+  KJ_EXPECT(boundedWrappedErrors.message.endsWith("Validation stopped after 64 errors."),
+      boundedWrappedErrors.message);
+
+  constexpr uint MAX_DYNAMIC_OBJECTS = 4096;
+  auto tooManyModules =
+      admin.addWorker("dynamic/modules", "modules"_kjb, [](config::Worker::Builder worker) {
+    worker.setCompatibilityDate("2025-09-01");
+    worker.initCompatibilityFlags(1).set(0, "new_module_registry");
+    auto modules = worker.initModules(MAX_DYNAMIC_OBJECTS + 1);
+    for (auto i: kj::zeroTo(modules.size())) {
+      modules[i].setName(kj::str("module-", i, ".js"));
+      modules[i].setEsModule("export default {};");
+    }
+  });
+  KJ_EXPECT(tooManyModules.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  auto tooManyBindings =
+      admin.addWorker("dynamic/bindings", "bindings"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('ok'); } }"_kj);
+    auto bindings = worker.initBindings(MAX_DYNAMIC_OBJECTS + 1);
+    for (auto i: kj::zeroTo(bindings.size())) {
+      bindings[i].setName(kj::str("B", i));
+      bindings[i].setText("value");
+    }
+  });
+  KJ_EXPECT(tooManyBindings.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  auto tooDeep = admin.addWorker("dynamic/deep", "deep"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('ok'); } }"_kj);
+    auto binding = worker.initBindings(1)[0];
+    for (auto i: kj::zeroTo(17)) {
+      binding.setName(kj::str("L", i));
+      auto wrapped = binding.initWrapped();
+      wrapped.setModuleName("test:unused");
+      binding = wrapped.initInnerBindings(1)[0];
+    }
+    binding.setName("VALUE");
+    binding.setText("value");
+  });
+  KJ_EXPECT(tooDeep.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  auto tooManyNamedExports = admin.addWorker(
+      "dynamic/named-exports", "named-exports"_kjb, [](config::Worker::Builder worker) {
+    worker.setCompatibilityDate("2024-10-01");
+    auto module = worker.initModules(1)[0];
+    module.setName("worker.js");
+    module.setCommonJsModule("module.exports = {};");
+    module.initNamedExports(MAX_DYNAMIC_OBJECTS + 1);
+  });
+  KJ_EXPECT(tooManyNamedExports.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  auto tooManyCryptoUsages = admin.addWorker(
+      "dynamic/crypto-usages", "crypto-usages"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('ok'); } }"_kj);
+    auto binding = worker.initBindings(1)[0];
+    binding.setName("KEY");
+    auto key = binding.initCryptoKey();
+    key.setRaw(nullptr);
+    key.getAlgorithm().setName("AES-GCM");
+    key.initUsages(MAX_DYNAMIC_OBJECTS + 1);
+  });
+  KJ_EXPECT(tooManyCryptoUsages.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  auto tooManyTails =
+      admin.addWorker("dynamic/tails", "tails"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('ok'); } }"_kj);
+    worker.initTails(MAX_DYNAMIC_OBJECTS / 2);
+    worker.initStreamingTails(MAX_DYNAMIC_OBJECTS / 2 + 1);
+  });
+  KJ_EXPECT(tooManyTails.status == admin::AddWorkerResult::RESTART_REQUIRED);
+
+  constexpr size_t MAX_WORKER_WORDS = 24 * 1024 * 1024 / sizeof(capnp::word);
+  auto addSized = [&](kj::StringPtr name, size_t targetWords) {
+    return admin.addWorker(name, name.asBytes(), [&](config::Worker::Builder worker) {
+      capnp::MallocMessageBuilder scratch;
+      auto scratchWorker = scratch.initRoot<config::Worker>();
+      scratchWorker.setCompatibilityDate("2024-10-01");
+      auto scratchModules = scratchWorker.initModules(2);
+      scratchModules[0].setName("worker.js");
+      scratchModules[0].setEsModule("export default {};");
+      scratchModules[1].setName("blob.bin");
+      scratchModules[1].initData(0);
+      size_t overheadWords = scratchWorker.asReader().totalSize().wordCount;
+      KJ_REQUIRE(targetWords >= overheadWords);
+
+      worker.setCompatibilityDate("2024-10-01");
+      auto modules = worker.initModules(2);
+      modules[0].setName("worker.js");
+      modules[0].setEsModule("export default {};");
+      modules[1].setName("blob.bin");
+      modules[1].initData((targetWords - overheadWords) * sizeof(capnp::word));
+      KJ_EXPECT(worker.asReader().totalSize().wordCount == targetWords);
+    });
+  };
+
+  auto atLimit = addSized("within-limit", MAX_WORKER_WORDS);
+  KJ_EXPECT(atLimit.status == admin::AddWorkerResult::ADDED, atLimit.message);
+  auto overLimit = addSized("over-limit", MAX_WORKER_WORDS + 1);
+  KJ_EXPECT(overLimit.status == admin::AddWorkerResult::RESTART_REQUIRED, overLimit.message);
+}
+
+KJ_TEST("Server: admin RPC bounds and releases the add-worker queue") {
+  TestServer test(R"((
+    services = [(name = "ingress", workerRouter = (header = "X-Worker-Route"))],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")]
+  ))"_kj);
+  TestAdminClient admin(test);
+  test.start();
+
+  auto sendPython = [&](kj::StringPtr name) {
+    auto request = admin.getClient().addWorkerRequest();
+    request.setServiceName(name);
+    request.setDigest(name.asBytes());
+    auto worker = request.initWorker();
+    worker.setCompatibilityDate("2023-12-18");
+    auto flags = worker.initCompatibilityFlags(2);
+    flags.set(0, "python_workers");
+    flags.set(1, "python_workers_20250116");
+    auto module = worker.initModules(1)[0];
+    module.setName("worker.py");
+    module.setPythonModule("def test(): pass");
+    return request.send();
+  };
+
+  {
+    auto first = sendPython("dynamic/blocked");
+    {
+      auto second = sendPython("dynamic/second");
+      auto third = sendPython("dynamic/third");
+      auto fourth = sendPython("dynamic/fourth");
+      auto fifth = sendPython("dynamic/fifth");
+      auto result = TestAdminClient::decode(fifth.wait(test.ws).getResult());
+      KJ_EXPECT(result.status == admin::AddWorkerResult::ERROR, result.message);
+    }
+
+    auto stillFull = sendPython("dynamic/still-full");
+    KJ_REQUIRE(stillFull.poll(test.ws));
+    auto result = TestAdminClient::decode(stillFull.wait(test.ws).getResult());
+    KJ_EXPECT(result.status == admin::AddWorkerResult::ERROR, result.message);
+  }
+
+  auto afterCancellation = admin.addWorker("dynamic/blocked", "javascript"_kjb,
+      [](config::Worker::Builder worker) { initModuleWorker(worker, "export default {}"_kj); });
+  KJ_EXPECT(afterCancellation.status == admin::AddWorkerResult::ADDED, afterCancellation.message);
 }
 
 KJ_TEST("Server: serve Service Worker using the new module registry") {
