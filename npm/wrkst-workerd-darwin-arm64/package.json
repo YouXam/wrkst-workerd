@@ -1,0 +1,23 @@
+{
+  "name": "@wrkst/workerd-darwin-arm64",
+  "version": "0.0.0",
+  "description": "workerd runtime for wrkst on macOS ARM64",
+  "repository": "https://github.com/YouXam/workerd",
+  "license": "Apache-2.0",
+  "preferUnplugged": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

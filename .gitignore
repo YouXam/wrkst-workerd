@@ -8,6 +8,8 @@
 
 node_modules
 /npm/*/bin
+!/npm/wrkst-workerd/bin/
+!/npm/wrkst-workerd/bin/wrkst-workerd
 /npm/workerd/install.js
 /npm/workerd/lib/
 package-lock.json
