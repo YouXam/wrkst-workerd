@@ -1,0 +1,89 @@
+name: wrkst workerd build
+
+on:
+  push:
+    branches:
+      - wrkst-main
+  pull_request:
+    branches:
+      - wrkst-main
+  workflow_dispatch:
+
+concurrency:
+  group: wrkst-workerd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-22.04
+            runner-arch: X64
+            bazel-config: ci-linux
+          - name: macos-arm64
+            runner: macos-15
+            runner-arch: ARM64
+            bazel-config: ci-macOS
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache Bazel data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/bazel-disk-cache
+            ~/bazel-repository-cache
+          key: wrkst-bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'build/ci.bazelrc', 'MODULE.bazel', 'MODULE.bazel.lock') }}
+
+      - name: Set up runner
+        uses: ./.github/actions/setup-runner
+        with:
+          GOOGLESOURCE_COOKIE: ''
+
+      - name: Build workerd
+        shell: bash
+        run: |
+          mkdir -p "$HOME/bazel-disk-cache" "$HOME/bazel-repository-cache"
+          bazel --batch build \
+            --config=ci \
+            --config=ci-limit-storage \
+            --config=${{ matrix.bazel-config }} \
+            --strip=always \
+            --jobs=2 \
+            --local_resources=cpu=2 \
+            --local_resources=memory=5120 \
+            --repository_cache="$HOME/bazel-repository-cache" \
+            --disk_cache="$HOME/bazel-disk-cache" \
+            //src/workerd/server:workerd
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          test "$RUNNER_ARCH" = "${{ matrix.runner-arch }}"
+          file bazel-bin/src/workerd/server/workerd
+          bazel-bin/src/workerd/server/workerd --version
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: wrkst-workerd-${{ matrix.name }}
+          path: bazel-bin/src/workerd/server/workerd
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Trim Bazel cache
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "$HOME/bazel-disk-cache" ]; then
+            find "$HOME/bazel-disk-cache" -type f -size +100M -delete
+            du -sh "$HOME/bazel-disk-cache" "$HOME/bazel-repository-cache"
+          fi
