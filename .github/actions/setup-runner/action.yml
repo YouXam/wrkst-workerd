@@ -4,6 +4,9 @@ inputs:
   GOOGLESOURCE_COOKIE:
     description: 'Cookie for googlesource.com'
     required: true
+  LLVM_PACKAGE_VERSION:
+    description: 'LLVM package version on apt.llvm.org'
+    default: '1:19.1.7~++20250114103320+cd708029e0b2-1~exp1~20250114103432.75'
 runs:
   using: 'composite'
   steps:
@@ -12,20 +15,20 @@ runs:
       if: runner.os == 'Linux'
       run: |
         export DEBIAN_FRONTEND=noninteractive
-        wget https://apt.llvm.org/llvm.sh
+        cp "$GITHUB_ACTION_PATH/llvm.sh" llvm.sh
         sed -i '/apt-get install/d' llvm.sh
         chmod +x llvm.sh
         sudo ./llvm.sh 19
         # keep in sync with build/ci.bazelrc
         sudo apt-get install -y -qq --no-install-recommends \
-          clang-19 \
-          lld-19 \
-          libunwind-19 \
-          libc++abi1-19 \
-          libc++1-19 \
-          libc++-19-dev \
-          libclang-rt-19-dev \
-          llvm-19
+          clang-19=${{ inputs.LLVM_PACKAGE_VERSION }} \
+          lld-19=${{ inputs.LLVM_PACKAGE_VERSION }} \
+          libunwind-19=${{ inputs.LLVM_PACKAGE_VERSION }} \
+          libc++abi1-19=${{ inputs.LLVM_PACKAGE_VERSION }} \
+          libc++1-19=${{ inputs.LLVM_PACKAGE_VERSION }} \
+          libc++-19-dev=${{ inputs.LLVM_PACKAGE_VERSION }} \
+          libclang-rt-19-dev=${{ inputs.LLVM_PACKAGE_VERSION }} \
+          llvm-19=${{ inputs.LLVM_PACKAGE_VERSION }}
         sudo ln -s /usr/bin/llvm-symbolizer-19 /usr/bin/llvm-symbolizer
         sudo ln -s /usr/bin/llvm-profdata-19 /usr/bin/llvm-profdata
         sudo ln -s /usr/bin/llvm-cov-19 /usr/bin/llvm-cov
