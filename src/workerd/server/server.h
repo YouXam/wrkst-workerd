@@ -241,6 +241,8 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
       uint defaultPort = 0);
 
   class HttpRewriter;
+  class WorkerService;
+  struct ErrorReporter;
 
   kj::Own<Service> makeInvalidConfigService();
   kj::Own<Service> makeExternalService(kj::StringPtr name,
@@ -250,9 +252,11 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   kj::Own<Service> makeDiskDirectoryService(kj::StringPtr name,
       config::DiskDirectory::Reader conf,
       kj::HttpHeaderTable::Builder& headerTableBuilder);
-  kj::Promise<kj::Own<Service>> makeWorker(kj::StringPtr name,
+  kj::Promise<kj::Own<WorkerService>> makeWorker(kj::StringPtr name,
       config::Worker::Reader conf,
-      capnp::List<config::Extension>::Reader extensions);
+      capnp::List<config::Extension>::Reader extensions,
+      ErrorReporter& errorReporter,
+      kj::Maybe<kj::Own<void>> maybeOwnedSourceCode = kj::none);
   kj::Promise<kj::Own<Service>> makeService(config::Service::Reader conf,
       kj::HttpHeaderTable::Builder& headerTableBuilder,
       capnp::List<config::Extension>::Reader extensions);
@@ -267,13 +271,15 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   // Can only be called in the link stage.
   //
   // May return a new object or may return a fake-own around a long-lived object.
-  kj::Own<Service> lookupService(
-      config::ServiceDesignator::Reader designator, kj::String errorContext);
+  kj::Own<Service> lookupService(config::ServiceDesignator::Reader designator,
+      kj::String errorContext,
+      kj::Maybe<ErrorReporter&> errorReporter = kj::none);
 
   // Like lookupService() but looks up an actor class (especially for use as a facet class).
   // Returns none on a config error.
-  kj::Own<ActorClass> lookupActorClass(
-      config::ServiceDesignator::Reader designator, kj::String errorContext);
+  kj::Own<ActorClass> lookupActorClass(config::ServiceDesignator::Reader designator,
+      kj::String errorContext,
+      kj::Maybe<ErrorReporter&> errorReporter = kj::none);
 
   // Pretty similar to lookupService() and lookupActorClass(), but these callbacks are called by
   // the `ChannelTokenHandler` when decoding tokens.
@@ -317,7 +323,6 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   class ExternalTcpService;
   class NetworkService;
   class DiskDirectoryService;
-  class WorkerService;
   class WorkerRouterService;
   class AdminService;
   class WorkerEntrypointService;
@@ -328,7 +333,6 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
 
   kj::Own<AdminService> adminService;
 
-  struct ErrorReporter;
   struct ConfigErrorReporter;
   struct DynamicErrorReporter;
   struct WorkerDef;
