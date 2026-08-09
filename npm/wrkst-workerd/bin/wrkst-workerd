@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+'use strict';
+
+const { spawn } = require('node:child_process');
+const { binaryPath } = require('../lib/platform');
+
+const child = spawn(binaryPath(), process.argv.slice(2), {
+  stdio: 'inherit',
+});
+
+const signalHandlers = new Map();
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  const handler = () => child.kill(signal);
+  signalHandlers.set(signal, handler);
+  process.on(signal, handler);
+}
+
+child.on('error', (error) => {
+  throw error;
+});
+
+child.on('exit', (code, signal) => {
+  if (!signal) process.exit(code ?? 1);
+  for (const [name, handler] of signalHandlers) {
+    process.removeListener(name, handler);
+  }
+  process.kill(process.pid, signal);
+});
