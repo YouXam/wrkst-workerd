@@ -3329,6 +3329,14 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
   kj::HashSet<kj::String> actorClasses;
   kj::HashSet<kj::String> workflowClasses;
 
+  virtual void addLinkError(kj::String error) {
+    addError(kj::mv(error));
+  }
+
+  virtual bool shouldStop() {
+    return false;
+  }
+
   void addEntrypoint(kj::Maybe<kj::StringPtr> exportName, kj::Array<kj::String> methods) override {
     kj::HashSet<kj::String> set;
     for (auto& method: methods) {
@@ -3373,20 +3381,42 @@ struct Server::ConfigErrorReporter final: public ErrorReporter {
   void addWarning(kj::String warning) override {
     server.handleReportConfigWarning(kj::str("service ", name, ": ", warning));
   }
+
+  void addLinkError(kj::String error) override {
+    server.handleReportConfigError(kj::mv(error));
+  }
 };
 
 // Implementation of ErrorReporter for dynamically-loaded Workers. We'll collect the errors and
 // report them in an exception at the end.
 struct Server::DynamicErrorReporter final: public ErrorReporter {
+  static constexpr size_t MAX_ERRORS = 64;
+
   kj::Vector<kj::String> errors;
+  bool truncated = false;
 
   void addError(kj::String error) override {
-    errors.add(kj::mv(error));
+    if (errors.size() < MAX_ERRORS) {
+      errors.add(kj::mv(error));
+    } else {
+      truncated = true;
+    }
+  }
+
+  bool shouldStop() override {
+    if (errors.size() < MAX_ERRORS) return false;
+    truncated = true;
+    return true;
+  }
+
+  kj::String getErrorMessage() {
+    auto message = kj::strArray(errors, "\n");
+    return truncated ? kj::str(message, "\nValidation stopped after 64 errors.") : kj::mv(message);
   }
 
   void throwIfErrors() {
     if (!errors.empty()) {
-      JSG_FAIL_REQUIRE(Error, "Failed to start Worker:\n", kj::strArray(errors, "\n"));
+      JSG_FAIL_REQUIRE(Error, "Failed to start Worker:\n", getErrorMessage());
     }
   }
 };
@@ -3411,8 +3441,7 @@ class Server::WorkerService final: public Service,
     kj::Maybe<kj::Network&> workerdDebugPortNetwork;
     kj::Maybe<Server&> workerdDebugPortServer;
   };
-  using LinkCallback =
-      kj::Function<LinkedIoChannels(WorkerService&, Worker::ValidationErrorReporter&)>;
+  using LinkCallback = kj::Function<LinkedIoChannels(WorkerService&, ErrorReporter&)>;
   using AbortActorsCallback = kj::Function<void(kj::Maybe<const kj::Exception&> reason)>;
   using DeleteActorsCallback = kj::Function<void(kj::Maybe<const kj::Exception&> reason)>;
 
@@ -3433,7 +3462,7 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Function<void()>> abortIsolateCallback = kj::none,
       kj::Maybe<kj::String> accessBlobHeaderNameParam = kj::none)
       : channelTokenHandler(channelTokenHandler),
-        serviceName(serviceName),
+        serviceName(serviceName.map([](kj::StringPtr name) { return kj::str(name); })),
         threadContext(threadContext),
         monotonicClock(monotonicClock),
         ioChannels(kj::mv(linkCallback)),
@@ -3602,7 +3631,7 @@ class Server::WorkerService final: public Service,
   void link(Worker::ValidationErrorReporter& errorReporter) override {
     LinkCallback callback =
         kj::mv(KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkCallback>(), "already called link()"));
-    auto linked = callback(*this, errorReporter);
+    auto linked = callback(*this, kj::downcast<ErrorReporter>(errorReporter));
 
     for (auto& ns: actorNamespaces) {
       ns.value->link(linked.actorStorage);
@@ -4167,9 +4196,9 @@ class Server::WorkerService final: public Service,
 
   ChannelTokenHandler& channelTokenHandler;
 
-  // This service's name as defined in the original config, or null if it's a dynamic isolate.
-  // Used only for serialization.
-  kj::Maybe<kj::StringPtr> serviceName;
+  // This service's stable name, or null for an isolate created by WorkerLoader.
+  // Used for serialization.
+  kj::Maybe<kj::String> serviceName;
 
   ThreadContext& threadContext;
   const kj::MonotonicClock& monotonicClock;
@@ -4705,7 +4734,10 @@ class Server::WorkerRouterService final: public Service {
 class Server::AdminService {
   class Impl final: public admin::WorkerdAdmin::Server {
    public:
-    Impl(workerd::server::Server& owner): owner(owner) {}
+    Impl(workerd::server::Server& owner, capnp::List<config::Extension>::Reader extensions)
+        : owner(owner),
+          extensions(extensions),
+          mutationQueue(kj::Promise<void>(kj::READY_NOW).fork()) {}
 
     kj::Promise<void> stats(StatsContext context) override {
       uint workerServiceCount = 0;
@@ -4718,12 +4750,264 @@ class Server::AdminService {
       return kj::READY_NOW;
     }
 
+    kj::Promise<void> addWorker(AddWorkerContext context) override {
+      auto params = context.getParams();
+      auto worker = params.getWorker();
+      auto serviceNameParam = params.getServiceName();
+      auto digestParam = params.getDigest();
+
+      auto setError = [&](kj::StringPtr message) {
+        context.getResults().initResult().setError(message);
+      };
+      auto setRestartRequired = [&](kj::StringPtr message) {
+        context.getResults().initResult().setRestartRequired(message);
+      };
+
+      if (serviceNameParam.size() == 0 || serviceNameParam.size() > MAX_SERVICE_NAME_BYTES) {
+        setError("serviceName must contain between 1 and 1024 bytes.");
+        co_return;
+      }
+      if (digestParam.size() == 0 || digestParam.size() > MAX_DIGEST_BYTES) {
+        setError("digest must contain between 1 and 64 bytes.");
+        co_return;
+      }
+
+      auto serviceName = kj::str(serviceNameParam);
+      auto digest = kj::heapArray<byte>(digestParam);
+
+      capnp::MessageSize workerSize;
+      KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() { workerSize = worker.totalSize(); })) {
+        setError(exception.getDescription());
+        co_return;
+      }
+      if (workerSize.wordCount > MAX_WORKER_WORDS) {
+        setRestartRequired("Worker configuration exceeds the dynamic add size limit.");
+        co_return;
+      }
+
+      auto turn = KJ_UNWRAP_OR(tryGetTurn(), {
+        setError("addWorker queue is full.");
+        co_return;
+      });
+      KJ_DEFER(turn.done->fulfill());
+      co_await turn.ready;
+
+      KJ_IF_SOME(existingDigest, loadedDigests.find(serviceName)) {
+        if (existingDigest.asPtr() == digest.asPtr()) {
+          context.getResults().initResult().setAlreadyLoaded();
+        } else {
+          setRestartRequired("A Worker with this serviceName is already loaded.");
+        }
+        co_return;
+      }
+      if (owner.services.find(serviceName) != kj::none) {
+        setRestartRequired("A static service with this serviceName already exists.");
+        co_return;
+      }
+      if (worker.isInherit()) {
+        setError("Dynamically-added Workers cannot use inherit.");
+        co_return;
+      }
+      KJ_IF_SOME(reason, getRestartReason(worker)) {
+        setRestartRequired(reason);
+        co_return;
+      }
+
+      if (owner.actorConfigs.find(serviceName) != kj::none) {
+        setError("Internal actor configuration already exists for serviceName.");
+        co_return;
+      }
+      owner.actorConfigs.insert(kj::str(serviceName), {});
+      bool keepActorConfig = false;
+      KJ_DEFER({
+        if (!keepActorConfig) owner.actorConfigs.erase(serviceName);
+      });
+
+      DynamicErrorReporter errorReporter;
+      kj::Own<WorkerService> workerService;
+      try {
+        auto workerBacking = kj::heap<DynamicWorkerBacking>(serviceName, worker);
+        auto stableServiceName = workerBacking->serviceName.asPtr();
+        auto ownedWorker = workerBacking->message.getRoot<config::Worker>().asReader();
+        kj::Own<void> workerBackingOwner = kj::mv(workerBacking);
+        workerService = co_await owner.makeWorker(
+            stableServiceName, ownedWorker, extensions, errorReporter, kj::mv(workerBackingOwner));
+      } catch (kj::Exception& exception) {
+        setError(exception.getDescription());
+        co_return;
+      }
+      if (!errorReporter.errors.empty()) {
+        setError(errorReporter.getErrorMessage());
+        co_return;
+      }
+
+      owner.services.insert(kj::str(serviceName), kj::mv(workerService));
+      bool keepService = false;
+      auto rollbackService = [&]() {
+        KJ_IF_SOME(service, owner.services.find(serviceName)) {
+          service->unlink();
+        }
+        owner.services.erase(serviceName);
+      };
+      KJ_DEFER({
+        if (!keepService) rollbackService();
+      });
+
+      auto& service = KJ_ASSERT_NONNULL(owner.services.find(serviceName));
+      KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() { service->link(errorReporter); })) {
+        setError(exception.getDescription());
+        co_return;
+      }
+      if (!errorReporter.errors.empty()) {
+        setError(errorReporter.getErrorMessage());
+        co_return;
+      }
+
+      loadedDigests.insert(kj::str(serviceName), kj::mv(digest));
+      keepService = true;
+      keepActorConfig = true;
+      context.getResults().initResult().setAdded();
+    }
+
    private:
+    static constexpr size_t MAX_SERVICE_NAME_BYTES = 1024;
+    static constexpr size_t MAX_DIGEST_BYTES = 64;
+    static constexpr uint64_t MAX_WORKER_WORDS = 24 * 1024 * 1024 / sizeof(capnp::word);
+    static constexpr uint MAX_DYNAMIC_MODULES = 4096;
+    static constexpr uint MAX_DYNAMIC_BINDING_NODES = 4096;
+    static constexpr uint MAX_DYNAMIC_NESTED_ITEMS = 4096;
+    static constexpr uint MAX_DYNAMIC_WRAPPED_DEPTH = 16;
+    static constexpr uint MAX_PENDING_ADDS = 4;
+
+    struct DynamicWorkerBacking {
+      DynamicWorkerBacking(kj::StringPtr serviceName, config::Worker::Reader worker)
+          : serviceName(kj::str(serviceName)) {
+        message.setRoot(worker);
+      }
+
+      kj::String serviceName;
+      capnp::MallocMessageBuilder message;
+    };
+
+    struct RpcTurn {
+      kj::Promise<void> ready;
+      kj::Own<kj::PromiseFulfiller<void>> done;
+    };
+
+    struct PendingAdds final: public kj::Refcounted {
+      uint count = 0;
+    };
+
     workerd::server::Server& owner;
+    capnp::List<config::Extension>::Reader extensions;
+    kj::HashMap<kj::String, kj::Array<byte>> loadedDigests;
+    kj::ForkedPromise<void> mutationQueue;
+    kj::Rc<PendingAdds> pendingAdds = kj::rc<PendingAdds>();
+
+    kj::Maybe<RpcTurn> tryGetTurn() {
+      if (pendingAdds->count >= MAX_PENDING_ADDS) return kj::none;
+
+      ++pendingAdds->count;
+      auto paf = kj::newPromiseAndFulfiller<void>();
+      auto previous = mutationQueue.addBranch().fork();
+      auto ready = previous.addBranch();
+      mutationQueue =
+          previous.addBranch()
+              .then([completion = kj::mv(paf.promise)]() mutable { return kj::mv(completion); })
+              .then([pendingAdds = pendingAdds.addRef()]() mutable { --pendingAdds->count; })
+              .eagerlyEvaluate(nullptr)
+              .fork();
+      return RpcTurn{kj::mv(ready), kj::mv(paf.fulfiller)};
+    }
+
+    bool tryCountNestedItems(uint count, uint& total) {
+      if (count > MAX_DYNAMIC_NESTED_ITEMS - total) return false;
+      total += count;
+      return true;
+    }
+
+    kj::Maybe<kj::StringPtr> getBindingRestartReason(
+        capnp::List<config::Worker::Binding>::Reader bindings,
+        uint depth,
+        uint& bindingCount,
+        uint& nestedItemCount) {
+      for (auto binding: bindings) {
+        if (++bindingCount > MAX_DYNAMIC_BINDING_NODES) {
+          return "Worker configuration exceeds the dynamic binding count limit."_kj;
+        }
+        if (binding.isCryptoKey() &&
+            !tryCountNestedItems(binding.getCryptoKey().getUsages().size(), nestedItemCount)) {
+          return "Worker configuration exceeds the dynamic nested item count limit."_kj;
+        }
+        if (binding.isParameter() && binding.getParameter().getType().isCryptoKey() &&
+            !tryCountNestedItems(
+                binding.getParameter().getType().getCryptoKey().size(), nestedItemCount)) {
+          return "Worker configuration exceeds the dynamic nested item count limit."_kj;
+        }
+        if (binding.isWorkerLoader()) {
+          return "Workers with workerLoader bindings require a restart."_kj;
+        }
+        if (binding.isWrapped()) {
+          if (depth >= MAX_DYNAMIC_WRAPPED_DEPTH) {
+            return "Worker configuration exceeds the dynamic wrapped binding depth limit."_kj;
+          }
+          KJ_IF_SOME(reason,
+              getBindingRestartReason(binding.getWrapped().getInnerBindings(), depth + 1,
+                  bindingCount, nestedItemCount)) {
+            return reason;
+          }
+        }
+      }
+      return kj::none;
+    }
+
+    kj::Maybe<kj::StringPtr> getRestartReason(config::Worker::Reader worker) {
+      if (worker.getDurableObjectNamespaces().size() > 0 ||
+          !worker.getDurableObjectStorage().isNone() ||
+          worker.hasDurableObjectUniqueKeyModifier()) {
+        return "Workers with Durable Object topology require a restart."_kj;
+      }
+      if (!worker.getContainerEngine().isNone()) {
+        return "Workers with a container engine require a restart."_kj;
+      }
+      if (worker.isModules() && worker.getModules().size() > MAX_DYNAMIC_MODULES) {
+        return "Worker configuration exceeds the dynamic module count limit."_kj;
+      }
+
+      uint nestedItemCount = 0;
+      if (!tryCountNestedItems(worker.getCompatibilityFlags().size(), nestedItemCount) ||
+          !tryCountNestedItems(worker.getTails().size(), nestedItemCount) ||
+          !tryCountNestedItems(worker.getStreamingTails().size(), nestedItemCount)) {
+        return "Worker configuration exceeds the dynamic nested item count limit."_kj;
+      }
+      if (worker.isModules()) {
+        for (auto module: worker.getModules()) {
+          if (!tryCountNestedItems(module.getNamedExports().size(), nestedItemCount)) {
+            return "Worker configuration exceeds the dynamic nested item count limit."_kj;
+          }
+        }
+      }
+
+      uint bindingCount = 0;
+      KJ_IF_SOME(reason,
+          getBindingRestartReason(worker.getBindings(), 0, bindingCount, nestedItemCount)) {
+        return reason;
+      }
+      if (worker.hasAccessBindingService()) {
+        return "Workers with accessBindingService require a restart."_kj;
+      }
+      if (owner.inspectorOverride != kj::none) {
+        return "Dynamic add is unavailable while the inspector is enabled."_kj;
+      }
+      return kj::none;
+    }
   };
 
  public:
-  AdminService(Server& owner, kj::Own<kj::AsyncIoStream> stream): server(kj::heap<Impl>(owner)) {
+  AdminService(Server& owner,
+      kj::Own<kj::AsyncIoStream> stream,
+      capnp::List<config::Extension>::Reader extensions)
+      : server(kj::heap<Impl>(owner, extensions)) {
     server.accept(kj::mv(stream));
   }
 
@@ -4736,10 +5020,11 @@ struct FutureSubrequestChannel {
       designator;
   kj::String errorContext;
 
-  kj::Own<IoChannelFactory::SubrequestChannel> lookup(Server& server) && {
+  kj::Own<IoChannelFactory::SubrequestChannel> lookup(
+      Server& server, Server::ErrorReporter& errorReporter) && {
     KJ_SWITCH_ONEOF(designator) {
       KJ_CASE_ONEOF(conf, config::ServiceDesignator::Reader) {
-        return server.lookupService(conf, kj::mv(errorContext));
+        return server.lookupService(conf, kj::mv(errorContext), errorReporter);
       }
       KJ_CASE_ONEOF(channel, kj::Own<IoChannelFactory::SubrequestChannel>) {
         return kj::mv(channel);
@@ -4759,10 +5044,11 @@ struct FutureActorClassChannel {
       designator;
   kj::String errorContext;
 
-  kj::Own<IoChannelFactory::ActorClassChannel> lookup(Server& server) && {
+  kj::Own<IoChannelFactory::ActorClassChannel> lookup(
+      Server& server, Server::ErrorReporter& errorReporter) && {
     KJ_SWITCH_ONEOF(designator) {
       KJ_CASE_ONEOF(conf, config::ServiceDesignator::Reader) {
-        return server.lookupActorClass(conf, kj::mv(errorContext));
+        return server.lookupActorClass(conf, kj::mv(errorContext), errorReporter);
       }
       KJ_CASE_ONEOF(channel, kj::Own<IoChannelFactory::ActorClassChannel>) {
         return kj::mv(channel);
@@ -4781,6 +5067,7 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
     config::Worker::Reader conf,
     config::Worker::Binding::Reader binding,
     Worker::ValidationErrorReporter& errorReporter,
+    kj::FunctionParam<bool()> shouldStop,
     kj::Vector<FutureSubrequestChannel>& subrequestChannels,
     kj::Vector<FutureActorChannel>& actorChannels,
     kj::Vector<FutureActorClassChannel>& actorClassChannels,
@@ -4788,6 +5075,8 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
     bool& hasWorkerdDebugPortBinding,
     kj::HashMap<kj::String, kj::HashMap<kj::String, Server::ActorConfig>>& actorConfigs,
     bool experimental) {
+  if (shouldStop()) return kj::none;
+
   // creates binding object or returns null and reports an error
   using Global = WorkerdApi::Global;
   kj::StringPtr bindingName = binding.getName();
@@ -5006,9 +5295,9 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
       kj::Vector<Global> innerGlobals;
       for (const auto& innerBinding: wrapped.getInnerBindings()) {
         KJ_IF_SOME(global,
-            createBinding(workerName, conf, innerBinding, errorReporter, subrequestChannels,
-                actorChannels, actorClassChannels, workerLoaderChannels, hasWorkerdDebugPortBinding,
-                actorConfigs, experimental)) {
+            createBinding(workerName, conf, innerBinding, errorReporter, shouldStop,
+                subrequestChannels, actorChannels, actorClassChannels, workerLoaderChannels,
+                hasWorkerdDebugPortBinding, actorConfigs, experimental)) {
           innerGlobals.add(kj::mv(global));
         } else {
           // we've already communicated the error
@@ -5654,13 +5943,13 @@ kj::Own<WorkerStubChannel> Server::WorkerService::loadIsolate(uint loaderChannel
   return channels.workerLoaders[loaderChannel]->loadIsolate(kj::mv(name), kj::mv(fetchSource));
 }
 
-kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
+kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorker(kj::StringPtr name,
     config::Worker::Reader conf,
-    capnp::List<config::Extension>::Reader extensions) {
+    capnp::List<config::Extension>::Reader extensions,
+    ErrorReporter& errorReporter,
+    kj::Maybe<kj::Own<void>> maybeOwnedSourceCode) {
   TRACE_EVENT("workerd", "Server::makeWorker()", "name", name.cStr());
   auto& localActorConfigs = KJ_ASSERT_NONNULL(actorConfigs.find(name));
-
-  ConfigErrorReporter errorReporter(*this, name);
 
   capnp::MallocMessageBuilder arena;
   // TODO(beta): Factor out FeatureFlags from WorkerBundle.
@@ -5693,10 +5982,12 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
   bool hasWorkerdDebugPortBinding = false;
 
   auto confBindings = conf.getBindings();
-  kj::Vector<WorkerdApi::Global> globals(confBindings.size());
+  kj::Vector<WorkerdApi::Global> globals;
   for (auto binding: confBindings) {
+    if (errorReporter.shouldStop()) break;
     KJ_IF_SOME(global,
-        createBinding(name, conf, binding, errorReporter, subrequestChannels, actorChannels,
+        createBinding(name, conf, binding, errorReporter,
+            [&]() { return errorReporter.shouldStop(); }, subrequestChannels, actorChannels,
             actorClassChannels, workerLoaderChannels, hasWorkerdDebugPortBinding, actorConfigs,
             experimental)) {
       globals.add(kj::mv(global));
@@ -5751,6 +6042,8 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
         jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target) {
       return WorkerdApi::from(api).compileGlobals(lock, globals, target, 1);
     },
+
+    .maybeOwnedSourceCode = kj::mv(maybeOwnedSourceCode),
     // clang-format on
 
     .accessBlobHeaderName = [&]() -> kj::Maybe<kj::String> {
@@ -6014,8 +6307,8 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   auto abortIsolateCallback = kj::mv(def.abortIsolateCallback);
   auto accessBlobHeaderName = kj::mv(def.accessBlobHeaderName);
 
-  auto linkCallback = [this, def = kj::mv(def), totalActorChannels](WorkerService& workerService,
-                          Worker::ValidationErrorReporter& errorReporter) mutable {
+  auto linkCallback = [this, def = kj::mv(def), totalActorChannels](
+                          WorkerService& workerService, ErrorReporter& errorReporter) mutable {
     WorkerService::LinkedIoChannels result;
 
     auto entrypointNames = workerService.getEntrypointNames();
@@ -6026,7 +6319,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
         def.subrequestChannels.size() + IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT +
         entrypointNames.size() + workerService.hasDefaultEntrypoint() + (hasAccessBinding ? 1 : 0));
 
-    auto globalService = kj::mv(def.globalOutbound).lookup(*this);
+    auto globalService = kj::mv(def.globalOutbound).lookup(*this, errorReporter);
 
     // Bind both "next" and "null" to the global outbound. (The difference between these is a
     // legacy artifact that no one should be depending on.)
@@ -6035,7 +6328,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     services.add(kj::mv(globalService));
 
     for (auto& channel: def.subrequestChannels) {
-      services.add(kj::mv(channel).lookup(*this));
+      services.add(kj::mv(channel).lookup(*this, errorReporter));
     }
 
     // Link the ctx.exports self-referential channels. Note that it's important these are added
@@ -6080,7 +6373,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
         def.actorClassChannels.size() + actorClassNames.size());
 
     for (auto& channel: def.actorClassChannels) {
-      actorClasses.add(kj::mv(channel).lookup(*this));
+      actorClasses.add(kj::mv(channel).lookup(*this, errorReporter));
     }
 
     auto linkedActorChannels = kj::heapArrayBuilder<kj::Maybe<ActorNamespace&>>(totalActorChannels);
@@ -6123,7 +6416,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     result.rpc = kj::mv(def.rpcChannels).releaseAsArray();
 
     KJ_IF_SOME(out, def.cacheApiOutbound) {
-      result.cache = kj::mv(out).lookup(*this);
+      result.cache = kj::mv(out).lookup(*this, errorReporter);
     }
 
     if (def.actorStorageConf.isLocalDisk()) {
@@ -6147,9 +6440,10 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       }
     }
 
-    result.tails = KJ_MAP(tail, def.tails) { return kj::mv(tail).lookup(*this); };
+    result.tails = KJ_MAP(tail, def.tails) { return kj::mv(tail).lookup(*this, errorReporter); };
 
-    result.streamingTails = KJ_MAP(tail, def.streamingTails) { return kj::mv(tail).lookup(*this); };
+    result.streamingTails =
+        KJ_MAP(tail, def.streamingTails) { return kj::mv(tail).lookup(*this, errorReporter); };
 
     result.workerLoaders = KJ_MAP(il, def.workerLoaderChannels) {
       KJ_IF_SOME(id, il.id) {
@@ -6223,8 +6517,10 @@ kj::Promise<kj::Own<Server::Service>> Server::makeService(config::Service::Reade
     case config::Service::NETWORK:
       co_return makeNetworkService(conf.getNetwork());
 
-    case config::Service::WORKER:
-      co_return co_await makeWorker(name, conf.getWorker(), extensions);
+    case config::Service::WORKER: {
+      ConfigErrorReporter errorReporter(*this, name);
+      co_return co_await makeWorker(name, conf.getWorker(), extensions, errorReporter);
+    }
 
     case config::Service::DISK:
       co_return makeDiskDirectoryService(name, conf.getDisk(), headerTableBuilder);
@@ -6251,11 +6547,20 @@ void Server::taskFailed(kj::Exception&& exception) {
   fatalFulfiller->reject(kj::mv(exception));
 }
 
-kj::Own<Server::Service> Server::lookupService(
-    config::ServiceDesignator::Reader designator, kj::String errorContext) {
+kj::Own<Server::Service> Server::lookupService(config::ServiceDesignator::Reader designator,
+    kj::String errorContext,
+    kj::Maybe<ErrorReporter&> errorReporter) {
+  auto reportError = [&](kj::String error) {
+    KJ_IF_SOME(reporter, errorReporter) {
+      reporter.addLinkError(kj::mv(error));
+    } else {
+      reportConfigError(kj::mv(error));
+    }
+  };
+
   kj::StringPtr targetName = designator.getName();
   Service* service = KJ_UNWRAP_OR(services.find(targetName), {
-    reportConfigError(kj::str(errorContext, " refers to a service \"", targetName,
+    reportError(kj::str(errorContext, " refers to a service \"", targetName,
         "\", but no such service is defined."));
     return kj::addRef(*invalidConfigServiceSingleton);
   });
@@ -6273,7 +6578,7 @@ kj::Own<Server::Service> Server::lookupService(
       case config::ServiceDesignator::Props::JSON:
         return Frankenvalue::fromJson(kj::str(props.getJson()));
     }
-    reportConfigError(kj::str(errorContext,
+    reportError(kj::str(errorContext,
         " has unrecognized props type. Was the config compiled with a "
         "newer version of the schema?"));
     return {};
@@ -6283,23 +6588,23 @@ kj::Own<Server::Service> Server::lookupService(
     KJ_IF_SOME(ep, worker.getEntrypoint(entrypointName, kj::mv(props))) {
       return kj::mv(ep);
     } else KJ_IF_SOME(ep, entrypointName) {
-      reportConfigError(kj::str(errorContext, " refers to service \"", targetName,
+      reportError(kj::str(errorContext, " refers to service \"", targetName,
           "\" with a named entrypoint \"", ep, "\", but \"", targetName,
           "\" has no such named entrypoint."));
       return kj::addRef(*invalidConfigServiceSingleton);
     } else {
-      reportConfigError(kj::str(errorContext, " refers to service \"", targetName,
+      reportError(kj::str(errorContext, " refers to service \"", targetName,
           "\", but does not specify an entrypoint, and the service does not have a "
           "default entrypoint."));
       return kj::addRef(*invalidConfigServiceSingleton);
     }
   } else {
     KJ_IF_SOME(ep, entrypointName) {
-      reportConfigError(kj::str(errorContext, " refers to service \"", targetName,
+      reportError(kj::str(errorContext, " refers to service \"", targetName,
           "\" with a named entrypoint \"", ep, "\", but \"", targetName,
           "\" is not a Worker, so does not have any named entrypoints."));
     } else if (!props.empty()) {
-      reportConfigError(kj::str(errorContext, " refers to service \"", targetName,
+      reportError(kj::str(errorContext, " refers to service \"", targetName,
           "\" and provides a `props` value, but \"", targetName,
           "\" is not a Worker, so cannot accept `props`"));
     }
@@ -6308,13 +6613,22 @@ kj::Own<Server::Service> Server::lookupService(
   }
 }
 
-kj::Own<Server::ActorClass> Server::lookupActorClass(
-    config::ServiceDesignator::Reader designator, kj::String errorContext) {
+kj::Own<Server::ActorClass> Server::lookupActorClass(config::ServiceDesignator::Reader designator,
+    kj::String errorContext,
+    kj::Maybe<ErrorReporter&> errorReporter) {
   // TODO(cleanup): There's a lot of repeated code with lookupService(), should it be refactored?
+
+  auto reportError = [&](kj::String error) {
+    KJ_IF_SOME(reporter, errorReporter) {
+      reporter.addLinkError(kj::mv(error));
+    } else {
+      reportConfigError(kj::mv(error));
+    }
+  };
 
   kj::StringPtr targetName = designator.getName();
   Service* service = KJ_UNWRAP_OR(services.find(targetName), {
-    reportConfigError(kj::str(errorContext, " refers to a service \"", targetName,
+    reportError(kj::str(errorContext, " refers to a service \"", targetName,
         "\", but no such service is defined."));
     return kj::addRef(*invalidConfigActorClassSingleton);
   });
@@ -6332,7 +6646,7 @@ kj::Own<Server::ActorClass> Server::lookupActorClass(
       case config::ServiceDesignator::Props::JSON:
         return Frankenvalue::fromJson(kj::str(props.getJson()));
     }
-    reportConfigError(kj::str(errorContext,
+    reportError(kj::str(errorContext,
         " has unrecognized props type. Was the config compiled with a "
         "newer version of the schema?"));
     return {};
@@ -6342,23 +6656,23 @@ kj::Own<Server::ActorClass> Server::lookupActorClass(
     KJ_IF_SOME(ep, worker.getActorClass(entrypointName, kj::mv(props))) {
       return kj::mv(ep);
     } else KJ_IF_SOME(ep, entrypointName) {
-      reportConfigError(kj::str(errorContext, " refers to service \"", targetName,
+      reportError(kj::str(errorContext, " refers to service \"", targetName,
           "\" with a Durable Object entrypoint \"", ep, "\", but \"", targetName,
           "\" has no such exported entrypoint class."));
       return kj::addRef(*invalidConfigActorClassSingleton);
     } else {
-      reportConfigError(kj::str(errorContext, " refers to service \"", targetName,
+      reportError(kj::str(errorContext, " refers to service \"", targetName,
           "\", but does not specify an entrypoint, and the service does export a "
           "Durable Object class as its default entrypoint."));
       return kj::addRef(*invalidConfigActorClassSingleton);
     }
   } else {
     KJ_IF_SOME(ep, entrypointName) {
-      reportConfigError(kj::str(errorContext, " refers to service \"", targetName,
+      reportError(kj::str(errorContext, " refers to service \"", targetName,
           "\" with a named Durable Object entrypoint \"", ep, "\", but \"", targetName,
           "\" is not a Worker, so does not have any named entrypoints."));
     } else {
-      reportConfigError(kj::str(errorContext, " refers to service \"", targetName,
+      reportError(kj::str(errorContext, " refers to service \"", targetName,
           "\" as a Durable Object class, but \"", targetName,
           "\" is not a Worker, so cannot be used as a class."));
     }
@@ -6998,7 +7312,7 @@ kj::Promise<void> Server::run(
   co_await startServices(v8System, config, headerTableBuilder, forkedDrainWhen);
 
   if (adminOverride.get() != nullptr) {
-    adminService = kj::heap<AdminService>(*this, kj::mv(adminOverride));
+    adminService = kj::heap<AdminService>(*this, kj::mv(adminOverride), config.getExtensions());
   }
 
   auto listenPromise = listenOnSockets(config, headerTableBuilder, forkedDrainWhen);
