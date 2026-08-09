@@ -254,7 +254,10 @@ wd_cc_library(
 
 wd_capnp_library(src = "docker-api.capnp")
 
-wd_capnp_library(src = "workerd-admin.capnp")
+wd_capnp_library(
+    src = "workerd-admin.capnp",
+    deps = [":workerd_capnp"],
+)
 
 wd_capnp_library(src = "log-schema.capnp")
 
