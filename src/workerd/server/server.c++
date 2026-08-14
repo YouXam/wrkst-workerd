@@ -3445,7 +3445,8 @@ class Server::WorkerService final: public Service,
   using AbortActorsCallback = kj::Function<void(kj::Maybe<const kj::Exception&> reason)>;
   using DeleteActorsCallback = kj::Function<void(kj::Maybe<const kj::Exception&> reason)>;
 
-  WorkerService(ChannelTokenHandler& channelTokenHandler,
+  WorkerService(Server& owner,
+      ChannelTokenHandler& channelTokenHandler,
       kj::Maybe<kj::StringPtr> serviceName,
       ThreadContext& threadContext,
       const kj::MonotonicClock& monotonicClock,
@@ -3477,7 +3478,8 @@ class Server::WorkerService final: public Service,
         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
         isDynamic(isDynamic),
         abortIsolateCallback(kj::mv(abortIsolateCallback)),
-        accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {}
+        accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)),
+        drainRegistration(owner, *this) {}
 
   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
   // the constructor itself since it sets up cyclic references, which will throw an exception if
@@ -3661,6 +3663,14 @@ class Server::WorkerService final: public Service,
 
   kj::HashMap<kj::StringPtr, kj::Own<ActorNamespace>>& getActorNamespaces() {
     return actorNamespaces;
+  }
+
+  bool hasWaitUntilTasks() {
+    return !waitUntilTasks.isEmpty();
+  }
+
+  kj::Promise<void> onWaitUntilTasksEmpty() {
+    return waitUntilTasks.onEmpty().attach(kj::addRef(*this));
   }
 
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
@@ -4220,6 +4230,7 @@ class Server::WorkerService final: public Service,
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
   kj::Maybe<kj::String> accessBlobHeaderName;
   kj::Maybe<kj::uint> accessBindingServiceChannel;
+  ListedWorkerService drainRegistration;
 
   // ---------------------------------------------------------------------------
   // implements kj::TaskSet::ErrorHandler
@@ -6488,7 +6499,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   kj::Maybe<kj::StringPtr> serviceName;
   if (!def.isDynamic) serviceName = name;
 
-  auto result = kj::refcounted<WorkerService>(channelTokenHandler, serviceName,
+  auto result = kj::refcounted<WorkerService>(*this, channelTokenHandler, serviceName,
       globalContext->threadContext, monotonicClock, kj::mv(worker),
       kj::mv(errorReporter.defaultEntrypoint), kj::mv(errorReporter.namedEntrypoints),
       kj::mv(errorReporter.actorClasses), kj::mv(linkCallback),
@@ -7267,6 +7278,7 @@ kj::Promise<void> Server::listenDebugPort(kj::Own<kj::ConnectionReceiver> listen
 kj::Promise<void> Server::handleDrain(kj::Promise<void> drainWhen) {
   co_await drainWhen;
   TRACE_EVENT("workerd", "Server::handleDrain()");
+  adminService = nullptr;
   // Tell all HttpServers to drain. This causes them to disconnect any connections that don't
   // have a request in-flight.
   for (auto& httpServer: httpServers) {
@@ -7278,6 +7290,45 @@ kj::Promise<void> Server::handleDrain(kj::Promise<void> drainWhen) {
     // dropping it won't actually cancel anything. But since that's not documented in drain()'s
     // doc comment, we instead add the promise to `tasks` to be safe.
     tasks.add(httpServer.httpServer.drain());
+  }
+}
+
+kj::Promise<void> Server::drainTasks() {
+  for (;;) {
+    kj::Vector<kj::Promise<void>> promises(workerServices.size() + 1);
+    if (!tasks.isEmpty()) {
+      promises.add(tasks.onEmpty());
+    }
+    for (auto& listed: workerServices) {
+      if (listed.workerService.hasWaitUntilTasks()) {
+        promises.add(listed.workerService.onWaitUntilTasksEmpty());
+      }
+    }
+
+    if (!promises.empty()) {
+      co_await kj::joinPromises(promises.releaseAsArray());
+    }
+
+    // Give a chance for any errors to bubble up before we return success. In particular
+    // Server::taskFailed() fulfills `fatalFulfiller`, which causes the server to exit with an error.
+    // But the `TaskSet` may have become empty at the same time. We want the error to win the race
+    // against the success.
+    //
+    // TODO(cleanup): A better solution would be for `TaskSet` to have a new variant of the
+    //   `onEmpty()` method like `onEmptyOrException()`, which propagates any exception thrown by
+    //   any task.
+    co_await kj::yieldUntilQueueEmpty();
+
+    if (!tasks.isEmpty()) continue;
+
+    bool allWaitUntilTasksEmpty = true;
+    for (auto& listed: workerServices) {
+      if (listed.workerService.hasWaitUntilTasks()) {
+        allWaitUntilTasksEmpty = false;
+        break;
+      }
+    }
+    if (allWaitUntilTasksEmpty) co_return;
   }
 }
 
@@ -7307,14 +7358,15 @@ kj::Promise<void> Server::run(
   auto [fatalPromise, fatalFulfiller] = kj::newPromiseAndFulfiller<void>();
   this->fatalFulfiller = kj::mv(fatalFulfiller);
 
-  auto forkedDrainWhen = handleDrain(kj::mv(drainWhen)).fork();
+  auto forkedDrainSignal = kj::mv(drainWhen).fork();
 
-  co_await startServices(v8System, config, headerTableBuilder, forkedDrainWhen);
+  co_await startServices(v8System, config, headerTableBuilder);
 
   if (adminOverride.get() != nullptr) {
     adminService = kj::heap<AdminService>(*this, kj::mv(adminOverride), config.getExtensions());
   }
 
+  auto forkedDrainWhen = handleDrain(forkedDrainSignal.addBranch()).fork();
   auto listenPromise = listenOnSockets(config, headerTableBuilder, forkedDrainWhen);
 
   // We should have registered all headers synchronously. This is important because we want to
@@ -7400,8 +7452,7 @@ kj::Promise<void> Server::preloadPython(
 
 kj::Promise<void> Server::startServices(jsg::V8System& v8System,
     config::Config::Reader config,
-    kj::HttpHeaderTable::Builder& headerTableBuilder,
-    kj::ForkedPromise<void>& forkedDrainWhen) {
+    kj::HttpHeaderTable::Builder& headerTableBuilder) {
   // ---------------------------------------------------------------------------
   // Configure services
   TRACE_EVENT("workerd", "startServices");
@@ -7696,17 +7747,7 @@ kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
         "override provided on the command line."));
   }
 
-  co_await tasks.onEmpty();
-
-  // Give a chance for any errors to bubble up before we return success. In particular
-  // Server::taskFailed() fulfills `fatalFulfiller`, which causes the server to exit with an error.
-  // But the `TaskSet` may have become empty at the same time. We want the error to win the race
-  // against the success.
-  //
-  // TODO(cleanup): A better solution would be for `TaskSet` to have a new variant of the
-  //   `onEmpty()` method like `onEmptyOrException()`, which propagates any exception thrown by
-  //   any task.
-  co_await kj::yieldUntilQueueEmpty();
+  co_await drainTasks();
 }
 
 // =======================================================================================
@@ -7739,7 +7780,7 @@ kj::Promise<bool> Server::test(jsg::V8System& v8System,
 
   auto forkedDrainWhen = kj::Promise<void>(kj::NEVER_DONE).fork();
 
-  co_await startServices(v8System, config, headerTableBuilder, forkedDrainWhen);
+  co_await startServices(v8System, config, headerTableBuilder);
 
   // Tests usually do not configure sockets, but they can, especially loopback sockets. Arrange
   // to wait on them. Crash if listening fails.
