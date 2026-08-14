@@ -140,6 +140,9 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
     reportConfigWarning(kj::mv(warning));
   }
 
+  bool hasDynamicWorkerStateForTest(kj::StringPtr name) {
+    return services.find(name) != kj::none || actorConfigs.find(name) != kj::none;
+  }
  private:
   kj::Filesystem& fs;
   kj::Timer& timer;
@@ -198,6 +201,23 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   // correctly construct dependent services.
   kj::HashMap<kj::String, kj::HashMap<kj::String, ActorConfig>> actorConfigs;
 
+  class WorkerService;
+  struct ListedWorkerService {
+    Server& owner;
+    WorkerService& workerService;
+    kj::ListLink<ListedWorkerService> link;
+
+    ListedWorkerService(Server& owner, WorkerService& workerService)
+        : owner(owner),
+          workerService(workerService) {
+      owner.workerServices.add(*this);
+    }
+    ~ListedWorkerService() noexcept(false) {
+      owner.workerServices.remove(*this);
+    }
+  };
+  kj::List<ListedWorkerService, &ListedWorkerService::link> workerServices;
+
   kj::HashMap<kj::String, kj::Own<Service>> services;
 
   class ActorNamespace;
@@ -239,6 +259,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   // This causes them to disconnect any connections that do not have a
   // request in flight.
   kj::Promise<void> handleDrain(kj::Promise<void> drainWhen);
+  kj::Promise<void> drainTasks();
 
   kj::Own<kj::TlsContext> makeTlsContext(config::TlsOptions::Reader conf);
   kj::Promise<kj::Own<kj::NetworkAddress>> makeTlsNetworkAddress(config::TlsOptions::Reader conf,
@@ -247,7 +268,6 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
       uint defaultPort = 0);
 
   class HttpRewriter;
-  class WorkerService;
   struct ErrorReporter;
 
   kj::Own<Service> makeInvalidConfigService();
@@ -351,8 +371,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
 
   kj::Promise<void> startServices(jsg::V8System& v8System,
       config::Config::Reader config,
-      kj::HttpHeaderTable::Builder& headerTableBuilder,
-      kj::ForkedPromise<void>& forkedDrainWhen);
+      kj::HttpHeaderTable::Builder& headerTableBuilder);
 
   kj::Promise<void> listenOnSockets(config::Config::Reader config,
       kj::HttpHeaderTable::Builder& headerTableBuilder,
