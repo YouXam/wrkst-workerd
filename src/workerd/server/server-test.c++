@@ -409,6 +409,10 @@ class TestServer final: private kj::Filesystem, private kj::EntropySource, priva
     return !KJ_REQUIRE_NONNULL(sockets.find(addr), addr)->connect().poll(ws);
   }
 
+  void disconnectListener(kj::StringPtr addr) {
+    sockets.erase(addr);
+  }
+
   // Expect an incoming connection on the given address and from a network with the given
   // allowed / denied peer list.
   TestStream receiveSubrequest(kj::StringPtr addr,
@@ -4843,6 +4847,330 @@ KJ_TEST("Server: drain incoming HTTP connections") {
 
   // And then the connection is, in fact, closed.
   KJ_EXPECT(conn2.isEof());
+}
+
+KJ_TEST("Server: drain waits for stateless waitUntil tasks") {
+  TestServer test(R"((
+    services = [
+      (name = "blocker", external = "wait-until"),
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2024-10-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `export default {
+                `  fetch(request, env, ctx) {
+                `    if (new URL(request.url).pathname === "/reject") {
+                `      ctx.waitUntil(Promise.reject(new Error("waitUntil rejection")));
+                `    } else {
+                `      ctx.waitUntil(env.BLOCKER.fetch("http://wait-until/"));
+                `    }
+                `    return new Response("done");
+                `  }
+                `}
+          )],
+          bindings = [(name = "BLOCKER", service = "blocker")],
+        )
+      ),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj);
+
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  auto blocked = test.connect("test-addr");
+  blocked.httpGet200("/block", "done");
+  auto subrequest = test.receiveSubrequest("wait-until");
+
+  auto rejected = test.connect("test-addr");
+  rejected.httpGet200("/reject", "done");
+
+  drain.fulfiller->fulfill();
+  KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+
+  subrequest.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: drain reaches quiescence across services and Durable Objects") {
+  TestServer test(R"((
+    services = [
+      (name = "gate", external = "wait-until-gate"),
+      (name = "blocker", external = "durable-wait-until"),
+      ( name = "target",
+        worker = (
+          compatibilityDate = "2024-10-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `export class Target extends DurableObject {
+                `  async start() {
+                `    this.ctx.waitUntil(this.env.BLOCKER.fetch("http://durable-wait-until/"));
+                `    return "target";
+                `  }
+                `}
+          )],
+          bindings = [(name = "BLOCKER", service = "blocker")],
+          durableObjectNamespaces = [(className = "Target", uniqueKey = "target")],
+          durableObjectStorage = (inMemory = void),
+        )
+      ),
+      ( name = "entry",
+        worker = (
+          compatibilityDate = "2024-10-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `export default {
+                `  fetch(request, env, ctx) {
+                `    ctx.waitUntil((async () => {
+                `      await env.GATE.fetch("http://wait-until-gate/");
+                `      const id = env.TARGET.idFromName("target");
+                `      await env.TARGET.get(id).start();
+                `    })());
+                `    return new Response("entry");
+                `  }
+                `}
+          )],
+          bindings = [
+            (name = "GATE", service = "gate"),
+            ( name = "TARGET",
+              durableObjectNamespace = (className = "Target", serviceName = "target") ),
+          ],
+        )
+      ),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "entry")],
+  ))"_kj);
+
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "entry");
+  auto gate = test.receiveSubrequest("wait-until-gate");
+
+  drain.fulfiller->fulfill();
+  KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+
+  gate.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  auto durable = test.receiveSubrequest("durable-wait-until");
+  KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+
+  durable.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: drain waits for an unnamed WorkerLoader isolate") {
+  TestServer test(R"((
+    services = [
+      (name = "blocker", external = "loader-wait-until"),
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2025-01-01",
+          compatibilityFlags = ["experimental"],
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `export default {
+                `  async fetch(request, env) {
+                `    const id = env.HOLDER.idFromName("holder");
+                `    return env.HOLDER.get(id).fetch(request);
+                `  }
+                `}
+                `export class Holder extends DurableObject {
+                `  async fetch(request) {
+                `    this.retainedStub = this.env.LOADER.get(null, () => ({
+                `      compatibilityDate: "2025-01-01",
+                `      mainModule: "child.js",
+                `      modules: {
+                `        "child.js": 'export default { fetch(request, env, ctx) { ctx.waitUntil((async () => { await env.BLOCKER.fetch("http://loader-wait-until/"); await env.RELEASE.release(); })()); return new Response("child"); } }',
+                `      },
+                `      env: {
+                `        BLOCKER: this.env.BLOCKER,
+                `        RELEASE: this.env.HOLDER.get(this.ctx.id),
+                `      },
+                `    }));
+                `    return this.retainedStub.getEntrypoint().fetch(request.url);
+                `  }
+                `  release() {
+                `    this.retainedStub = null;
+                `    gc();
+                `    gc();
+                `  }
+                `}
+          )],
+          bindings = [
+            (name = "LOADER", workerLoader = ()),
+            (name = "BLOCKER", service = "blocker"),
+            (name = "HOLDER", durableObjectNamespace = "Holder"),
+          ],
+          durableObjectNamespaces = [(className = "Holder", uniqueKey = "holder")],
+          durableObjectStorage = (inMemory = void),
+        )
+      ),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj);
+  test.server.allowExperimental();
+
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "child");
+  auto subrequest = test.receiveSubrequest("loader-wait-until");
+
+  drain.fulfiller->fulfill();
+  KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+
+  subrequest.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: drain closes admin and waits for published dynamic workers") {
+  {
+    TestServer earlyTest(R"((
+      services = [(name = "ingress", workerRouter = (header = "X-Worker-Route"))],
+    ))"_kj);
+    TestAdminClient earlyAdmin(earlyTest);
+    auto earlyDrain = kj::newPromiseAndFulfiller<void>();
+    earlyDrain.fulfiller->fulfill();
+
+    auto runTask = earlyTest.server.run(v8System, *earlyTest.config, kj::mv(earlyDrain.promise));
+    KJ_REQUIRE(runTask.poll(earlyTest.ws));
+
+    auto stats = earlyAdmin.getClient().statsRequest().send();
+    if (stats.poll(earlyTest.ws)) {
+      auto exception = kj::runCatchingExceptions([&]() { stats.wait(earlyTest.ws); });
+      KJ_EXPECT(exception != kj::none);
+    } else {
+      KJ_FAIL_EXPECT("admin RPC remained open after an early drain");
+    }
+  }
+
+  TestServer test(R"((
+    services = [
+      (name = "blocker", external = "dynamic-wait-until"),
+      (name = "ingress", workerRouter = (header = "X-Worker-Route", servicePrefix = "dynamic/")),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  auto added =
+      admin.addWorker("dynamic/published", "published"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        fetch(request, env, ctx) {
+          ctx.waitUntil(env.BLOCKER.fetch("http://dynamic-wait-until/"));
+          return new Response("published");
+        }
+      }
+    )"_kj);
+    auto binding = worker.initBindings(1)[0];
+    binding.setName("BLOCKER");
+    binding.initService().setName("blocker");
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+
+  expectRoute(test, "published", "published");
+  auto subrequest = test.receiveSubrequest("dynamic-wait-until");
+
+  auto pendingRequest = admin.getClient().addWorkerRequest();
+  pendingRequest.setServiceName("dynamic/pending");
+  pendingRequest.setDigest("pending"_kjb);
+  auto pendingWorker = pendingRequest.initWorker();
+  pendingWorker.setCompatibilityDate("2023-12-18");
+  auto flags = pendingWorker.initCompatibilityFlags(2);
+  flags.set(0, "python_workers");
+  flags.set(1, "python_workers_20250116");
+  auto module = pendingWorker.initModules(1)[0];
+  module.setName("worker.py");
+  module.setPythonModule("def test(): pass");
+  auto pending = pendingRequest.send();
+  KJ_EXPECT(!pending.poll(test.ws));
+
+  drain.fulfiller->fulfill();
+  KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+
+  if (pending.poll(test.ws)) {
+    auto exception = kj::runCatchingExceptions([&]() { pending.wait(test.ws); });
+    KJ_EXPECT(exception != kj::none);
+  } else {
+    KJ_FAIL_EXPECT("pending addWorker RPC was not canceled");
+  }
+  KJ_EXPECT(!test.server.hasDynamicWorkerStateForTest("dynamic/pending"));
+
+  subrequest.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: fatal task failure bypasses waitUntil drain") {
+  TestServer test(R"((
+    services = [
+      (name = "blocker", external = "fatal-wait-until"),
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2024-10-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `export default {
+                `  fetch(request, env, ctx) {
+                `    ctx.waitUntil(env.BLOCKER.fetch("http://fatal-wait-until/"));
+                `    return new Response("done");
+                `  }
+                `}
+          )],
+          bindings = [(name = "BLOCKER", service = "blocker")],
+        )
+      ),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj);
+
+  auto runTask = test.server.run(v8System, *test.config);
+  KJ_EXPECT(!runTask.poll(test.ws));
+
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "done");
+  auto subrequest = test.receiveSubrequest("fatal-wait-until");
+
+  test.disconnectListener("test-addr");
+  if (runTask.poll(test.ws)) {
+    auto exception = kj::runCatchingExceptions([&]() { runTask.wait(test.ws); });
+    KJ_EXPECT(exception != kj::none);
+  } else {
+    KJ_FAIL_EXPECT("fatal listener failure did not stop the server");
+  }
 }
 
 // =======================================================================================
