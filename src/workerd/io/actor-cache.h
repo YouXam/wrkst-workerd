@@ -204,6 +204,12 @@ class ActorCacheInterface: public ActorCacheOps {
   // See `ActorSqlite::blockTransaction()` for additional details on the semantics.
   virtual void blockTransaction(kj::Promise<void> promise) = 0;
 
+  // Synchronously prevents new storage operations, then resolves once local storage resources have
+  // been released. Backends without revocable local storage return none.
+  virtual kj::Maybe<kj::Promise<void>> revokeStorage(kj::Exception reason) {
+    return kj::none;
+  }
+
   class Transaction: public ActorCacheOps {
    public:
     // Write all changes to the underlying ActorCache.
