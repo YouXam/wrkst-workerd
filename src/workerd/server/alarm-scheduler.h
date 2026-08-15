@@ -83,8 +83,24 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   // Cancels all pending alarms and removes them from persistent storage.
   void deleteAll();
 
+  // Stops new alarm execution while pending storage commits finish updating alarm rows.
+  void beginRevoke(kj::Exception reason);
+  // Synchronously closes alarm storage. The returned promise drains handlers that already started.
+  kj::Promise<void> finishRevoke();
+
+  SqliteDatabase& getStorageForTest() {
+    return *db;
+  }
+  bool hasAlarmForTest(ActorKey actor) {
+    return alarms.find(actor) != kj::none;
+  }
+  bool hasActiveAlarmTasksForTest() {
+    return !tasks.isEmpty();
+  }
+
  private:
   enum class AlarmStatus { WAITING, STARTED, FINISHED };
+  enum class State { ACTIVE, REVOKING, REVOKED };
   const kj::Clock& clock;
   kj::Timer& timer;
   std::default_random_engine random;
@@ -96,6 +112,7 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
     kj::Own<ActorKey> actor;
     kj::Date scheduledTime;
     kj::Promise<void> task;
+    bool taskStarted = false;
     kj::Maybe<kj::Date> queuedAlarm = kj::none;
     // Once started, an alarm can have a single alarm queued behind it.
     AlarmStatus status = AlarmStatus::WAITING;
@@ -114,6 +131,9 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   };
 
   kj::HashMap<ActorKey, ScheduledAlarm> alarms;
+  State state = State::ACTIVE;
+  kj::Maybe<kj::Exception> revokeReason;
+  kj::Maybe<kj::ForkedPromise<void>> revokeTask;
 
   struct RetryInfo {
     bool retry;
@@ -143,6 +163,8 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   )");
 
   void taskFailed(kj::Exception&& exception) override;
+  void requireActive();
+  void requireNotRevoked();
 
   int maxJitterMsForDelay(kj::Duration delay);
 
