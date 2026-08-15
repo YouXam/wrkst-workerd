@@ -87,12 +87,15 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
   //   transaction is being rolled back.
   void blockTransaction(kj::Promise<void> promise) override;
 
+  kj::Maybe<kj::Promise<void>> revokeStorage(kj::Exception reason) override;
+
   kj::Maybe<SqliteDatabase&> getSqliteDatabase() override {
+    requireStorageNotRevoked();
     return *db;
   }
 
   kj::Maybe<SqliteKv&> getSqliteKv() override {
-    requireNotBroken();
+    requireStorageActive();
     return kv;
   }
 
@@ -156,6 +159,9 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
   SqliteDatabase::Statement commitTxn = db->prepare(TRUSTED_TXN_COMMIT, "COMMIT TRANSACTION");
 
   kj::Maybe<kj::Exception> broken;
+  kj::Maybe<kj::Exception> storageRevokeReason;
+  kj::Maybe<kj::ForkedPromise<void>> storageRevokeTask;
+  bool abortImplicitTxnForRevoke = false;
 
   struct NoTxn {};
 
@@ -371,6 +377,9 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
   void taskFailed(kj::Exception&& exception) override;
 
   void requireNotBroken();
+  void requireStorageNotRevoked();
+  void requireStorageActive();
+  kj::Promise<void> revokeStorageImpl();
 
   // Called when DeferredAlarmDeleter is destroyed, to delete alarm if not reset or cancelled
   // during handler.
