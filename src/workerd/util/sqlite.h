@@ -289,7 +289,10 @@ class SqliteDatabase {
   // may throw if they depend on tables that haven't been recreated yet).
   void reset();
 
-  // Objects that need to be notified when reset() is called may inherit `ResetListener`.
+  // Permanently closes without a close-time WAL checkpoint. Later operations throw the reason.
+  void close(kj::Exception reason);
+
+  // Objects that hold connection-derived state may inherit `ResetListener`.
   class ResetListener {
    public:
     ResetListener(SqliteDatabase& db): db(db) {
@@ -303,8 +306,7 @@ class SqliteDatabase {
       db.resetListeners.add(*this);
     }
 
-    // When the database's `reset()` method is called, all listeners' `beforeSqliteReset()` will be
-    // called before actually resetting the database.
+    // Called before reset() or close() closes the current SQLite connection.
     virtual void beforeSqliteReset() = 0;
 
    protected:  // so that subclasses don't have to store their own copy of the `db` reference
@@ -366,8 +368,12 @@ class SqliteDatabase {
 
   kj::Maybe<const ActorAccountLimits&> actorAccountLimits;
 
-  // This pointer can be left null if a call to reset() failed to re-open the database.
+  // Null after close() or if reset() failed to re-open the database.
   kj::Maybe<sqlite3&> maybeDb;
+  kj::Maybe<kj::Exception> closedReason;
+  kj::Maybe<kj::Exception> resetFailure;
+  kj::Maybe<kj::Exception> pendingCloseError;
+  bool closing = false;
 
   // Set while a query is compiling.
   kj::Maybe<StaticRegulator> currentRegulator;
@@ -406,6 +412,12 @@ class SqliteDatabase {
   bool inTransaction = false;
 
   void init(kj::Maybe<kj::WriteMode> maybeMode);
+  void throwIfClosed();
+  void throwIfUnavailable();
+  void closeCurrentConnection(sqlite3& db, kj::StringPtr errorMessage);
+  kj::Maybe<kj::Exception> rollbackForClose(sqlite3& db);
+  void rememberCloseError(kj::Maybe<kj::Exception> error);
+  kj::Maybe<kj::Exception> finishRollback(kj::Maybe<kj::Exception> firstError);
 
   // Describes various kinds of interesting state changes which a statement might apply, which we
   // need to track to implement the SqliteDatabse interface. In particular, we must track
@@ -561,6 +573,7 @@ class SqliteDatabase::Query final: private ResetListener {
 
   // If true, there are no more rows. (When true, the methods below must not be called.)
   bool isDone() {
+    db.throwIfUnavailable();
     return done;
   }
 
