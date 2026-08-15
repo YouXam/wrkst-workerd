@@ -184,7 +184,191 @@ struct ActorSqliteTest final {
   auto sync() {
     return actor.onNoPendingFlush(nullptr);
   }
+  kj::Promise<void> revoke(kj::StringPtr message = "storage revoked"_kj) {
+    auto result = actor.revokeStorage(KJ_EXCEPTION(DISCONNECTED, kj::str(message)));
+    return kj::mv(KJ_ASSERT_NONNULL(result));
+  }
 };
+
+kj::Maybe<kj::Array<byte>> readStoredValue(ActorSqliteTest& test, kj::StringPtr key) {
+  SqliteDatabase successor(
+      test.vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  SqliteKv kv(successor);
+  kj::Maybe<kj::Array<byte>> result;
+  kv.get(key, [&](kj::ArrayPtr<const byte> value) { result = kj::heapArray(value); });
+  return result;
+}
+
+KJ_TEST("storage revoke fences ActorSqlite before close") {
+  ActorSqliteTest test;
+
+  auto& db = KJ_ASSERT_NONNULL(test.actor.getSqliteDatabase());
+  auto query = db.run("SELECT 1");
+  test.put("pending", "value");
+  auto revoke = test.revoke();
+
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.getSqliteDatabase());
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.getSqliteKv());
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.get("key"));
+  KJ_EXPECT_THROW_MESSAGE(
+      "storage revoked", test.actor.get(kj::arr(kj::str("key")), ActorCache::ReadOptions{}));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.getAlarm(ActorCache::ReadOptions{}));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.put("key", "value"));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked",
+      test.actor.put(kj::arr(ActorCache::KeyValuePair{
+                       kj::str("key"), kj::heapArray(kj::str("value").asBytes())}),
+          ActorCache::WriteOptions{}, nullptr));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked",
+      test.actor.list(kj::str(""), kj::none, kj::none, ActorCache::ReadOptions{}));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked",
+      test.actor.listReverse(kj::str(""), kj::none, kj::none, ActorCache::ReadOptions{}));
+  KJ_EXPECT_THROW_MESSAGE(
+      "storage revoked", test.actor.delete_(kj::str("key"), ActorCache::WriteOptions{}, nullptr));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked",
+      test.actor.delete_(kj::arr(kj::str("key")), ActorCache::WriteOptions{}, nullptr));
+  KJ_EXPECT_THROW_MESSAGE(
+      "storage revoked", test.actor.setAlarm(oneMs, ActorCache::WriteOptions{}, nullptr));
+  KJ_EXPECT_THROW_MESSAGE(
+      "storage revoked", test.actor.deleteAll(ActorCache::WriteOptions{}, nullptr));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.startTransaction());
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.onNoPendingFlush(nullptr));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.getCurrentBookmark(nullptr));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.waitForBookmark("0"_kj, nullptr));
+  KJ_EXPECT_THROW_MESSAGE(
+      "storage revoked", test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.abandonAlarm(oneMs));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.blockTransaction(kj::READY_NOW));
+  KJ_EXPECT(!query.isDone());
+
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  revoke.wait(test.ws);
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", query.isDone());
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", db.run("SELECT 1"));
+  KJ_EXPECT(test.actor.evictStale(kj::UNIX_EPOCH) == kj::none);
+}
+
+KJ_TEST("storage revoke drains an unblocked implicit transaction") {
+  ActorSqliteTest test;
+
+  test.put("key", "value");
+  auto revoke = test.revoke();
+  KJ_EXPECT(!revoke.poll(test.ws));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.get("key"));
+
+  auto commit = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
+  KJ_EXPECT(!revoke.poll(test.ws));
+  commit->fulfill();
+  revoke.wait(test.ws);
+
+  auto value = KJ_ASSERT_NONNULL(readStoredValue(test, "key"_kj));
+  KJ_EXPECT(value == kj::str("value").asBytes());
+}
+
+KJ_TEST("storage revoke waits for an in-flight commit callback") {
+  ActorSqliteTest test;
+
+  test.put("key", "value");
+  auto commit = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
+
+  auto revoke = test.revoke();
+  KJ_EXPECT(!revoke.poll(test.ws));
+  commit->fulfill();
+  revoke.wait(test.ws);
+
+  auto value = KJ_ASSERT_NONNULL(readStoredValue(test, "key"_kj));
+  KJ_EXPECT(value == kj::str("value").asBytes());
+}
+
+KJ_TEST("storage revoke cancels a blocked implicit transaction") {
+  ActorSqliteTest test({.monitorOutputGate = false});
+  auto gateBroken = test.gate.onBroken();
+  auto paf = kj::newPromiseAndFulfiller<void>();
+  bool canceled = false;
+
+  test.actor.blockTransaction(paf.promise.attach(kj::defer([&]() { canceled = true; })));
+  test.put("key", "value");
+
+  test.revoke().wait(test.ws);
+  KJ_EXPECT(canceled);
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", gateBroken.wait(test.ws));
+  test.pollAndExpectCalls({});
+  KJ_EXPECT(readStoredValue(test, "key"_kj) == kj::none);
+}
+
+KJ_TEST("storage revoke rolls back live explicit transactions") {
+  ActorSqliteTest test;
+
+  auto parent = test.startTransaction();
+  parent->put(kj::str("parent"), kj::heapArray(kj::str("one").asBytes()), {}, nullptr);
+  auto child = test.startTransaction();
+  child->put(kj::str("child"), kj::heapArray(kj::str("two").asBytes()), {}, nullptr);
+
+  test.revoke().wait(test.ws);
+  KJ_EXPECT(readStoredValue(test, "parent"_kj) == kj::none);
+  KJ_EXPECT(readStoredValue(test, "child"_kj) == kj::none);
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", child->get(kj::str("child"), {}));
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", child->commit());
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", child->rollback());
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", parent->commit());
+
+  child = nullptr;
+  parent = nullptr;
+}
+
+KJ_TEST("storage revoke lets an existing cursor finish only until close") {
+  ActorSqliteTest test;
+
+  test.put("a", "one");
+  test.put("b", "two");
+  test.put("c", "three");
+  auto commit = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
+
+  auto& kv = KJ_ASSERT_NONNULL(test.actor.getSqliteKv());
+  auto cursor = kv.list(""_kj, kj::none, kj::none, SqliteKv::FORWARD);
+  auto revoke = test.revoke();
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.actor.getSqliteKv());
+  KJ_EXPECT(KJ_ASSERT_NONNULL(cursor->next()).key == "a"_kj);
+
+  commit->fulfill();
+  revoke.wait(test.ws);
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", cursor->next());
+}
+
+KJ_TEST("storage revoke prevents deferred alarm deletion") {
+  ActorSqliteTest test;
+
+  test.setAlarm(oneMs);
+  test.pollAndExpectCalls({"scheduleRun(1ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
+  auto deferredDelete = kj::mv(armResult.get<ActorSqlite::RunAlarmHandler>().deferredDelete);
+  test.revoke().wait(test.ws);
+  deferredDelete = nullptr;
+
+  SqliteDatabase successor(
+      test.vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  SqliteMetadata metadata(successor);
+  KJ_EXPECT(metadata.getAlarm() == oneMs);
+  test.pollAndExpectCalls({});
+}
+
+KJ_TEST("storage revoke is idempotent") {
+  ActorSqliteTest test;
+
+  test.put("key", "value");
+  auto first = test.revoke("first revoke"_kj);
+  auto second = test.revoke("second revoke"_kj);
+  KJ_EXPECT(!first.poll(test.ws));
+  KJ_EXPECT(!second.poll(test.ws));
+
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  first.wait(test.ws);
+  second.wait(test.ws);
+  test.revoke("third revoke"_kj).wait(test.ws);
+  KJ_EXPECT_THROW_MESSAGE("first revoke", test.get("key"));
+  test.pollAndExpectCalls({});
+}
 
 KJ_TEST("initial alarm value is unset") {
   ActorSqliteTest test;
