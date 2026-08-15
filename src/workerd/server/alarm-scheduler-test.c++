@@ -38,31 +38,91 @@ class AdjustableClock final: public kj::Clock {
   kj::Date time = kj::UNIX_EPOCH;
 };
 
-// Minimal WorkerInterface that supports runAlarm() and abandonAlarm(); every other entry point is
-// unused by the alarm scheduler tests. By default, runAlarm() reports success (no retry) and invokes
-// `onAlarm` so the test can observe that the alarm fired.
-class AlarmStubWorkerInterface final: public WorkerInterface {
- public:
-  explicit AlarmStubWorkerInterface(kj::Function<void()> onAlarm)
-      : onAlarm(kj::mv(onAlarm)),
-        onAbandon([]() { return kj::Maybe<kj::Date>(kj::none); }) {}
+// Test double for the alarm scheduler's WorkerInterface; every entry point other than
+// runAlarm() and abandonAlarm() is unused here. Tests that block or observe handlers hold an
+// AlarmStubState and construct the stub over it; simpler tests use the owning constructors.
+struct AlarmStubState {
+  kj::Function<void()> onRun = []() {};
+  WorkerInterface::AlarmOutcome outcome{
+    .retry = false, .retryCountsAgainstLimit = true, .outcome = EventOutcome::OK};
+  bool blockRun = false;
+  bool runSettled = false;
+  bool runCanceled = false;
+  uint runCount = 0;
+  kj::Maybe<kj::Own<kj::PromiseFulfiller<WorkerInterface::AlarmResult>>> runFulfiller;
 
-  AlarmStubWorkerInterface(kj::Function<void()> onAlarm,
-      AlarmOutcome outcome,
-      kj::Function<kj::Promise<kj::Maybe<kj::Date>>()> onAbandon)
-      : onAlarm(kj::mv(onAlarm)),
-        outcome(outcome),
-        onAbandon(kj::mv(onAbandon)) {}
+  bool blockAbandon = false;
+  bool abandonSettled = false;
+  bool abandonCanceled = false;
+  uint abandonCount = 0;
+  kj::Maybe<kj::Own<kj::PromiseFulfiller<kj::Maybe<kj::Date>>>> abandonFulfiller;
 
-  kj::Promise<AlarmResult> runAlarm(kj::Date, uint32_t) override {
-    onAlarm();
-    return AlarmResult{.retry = outcome.retry,
+  // When set, abandonAlarm() defers to this instead of the block/fulfiller machinery.
+  kj::Maybe<kj::Function<kj::Promise<kj::Maybe<kj::Date>>()>> onAbandon;
+
+  WorkerInterface::AlarmResult makeResult() const {
+    return {.retry = outcome.retry,
       .retryCountsAgainstLimit = outcome.retryCountsAgainstLimit,
       .outcome = outcome.outcome};
   }
 
+  void finishRun() {
+    runSettled = true;
+    auto fulfiller = kj::mv(KJ_ASSERT_NONNULL(runFulfiller));
+    fulfiller->fulfill(makeResult());
+  }
+
+  void finishAbandon() {
+    abandonSettled = true;
+    auto fulfiller = kj::mv(KJ_ASSERT_NONNULL(abandonFulfiller));
+    fulfiller->fulfill(kj::none);
+  }
+};
+
+class AlarmStubWorkerInterface final: public WorkerInterface {
+ public:
+  explicit AlarmStubWorkerInterface(AlarmStubState& state): state(state) {}
+
+  explicit AlarmStubWorkerInterface(kj::Function<void()> onAlarm)
+      : ownState(kj::heap<AlarmStubState>()),
+        state(*ownState) {
+    state.onRun = kj::mv(onAlarm);
+  }
+
+  AlarmStubWorkerInterface(kj::Function<void()> onAlarm,
+      AlarmOutcome outcome,
+      kj::Function<kj::Promise<kj::Maybe<kj::Date>>()> onAbandon)
+      : ownState(kj::heap<AlarmStubState>()),
+        state(*ownState) {
+    state.onRun = kj::mv(onAlarm);
+    state.outcome = outcome;
+    state.onAbandon = kj::mv(onAbandon);
+  }
+
+  kj::Promise<AlarmResult> runAlarm(kj::Date, uint32_t) override {
+    ++state.runCount;
+    state.onRun();
+    if (!state.blockRun) return state.makeResult();
+
+    auto paf = kj::newPromiseAndFulfiller<AlarmResult>();
+    state.runFulfiller = kj::mv(paf.fulfiller);
+    return kj::mv(paf.promise).attach(kj::defer([&state = state]() {
+      if (!state.runSettled) state.runCanceled = true;
+    }));
+  }
+
   kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date) override {
-    return onAbandon();
+    ++state.abandonCount;
+    KJ_IF_SOME(f, state.onAbandon) {
+      return f();
+    }
+    if (!state.blockAbandon) return kj::Maybe<kj::Date>(kj::none);
+
+    auto paf = kj::newPromiseAndFulfiller<kj::Maybe<kj::Date>>();
+    state.abandonFulfiller = kj::mv(paf.fulfiller);
+    return kj::mv(paf.promise).attach(kj::defer([&state = state]() {
+      if (!state.abandonSettled) state.abandonCanceled = true;
+    }));
   }
 
   kj::Promise<void> request(kj::HttpMethod,
@@ -90,10 +150,192 @@ class AlarmStubWorkerInterface final: public WorkerInterface {
   }
 
  private:
-  kj::Function<void()> onAlarm;
-  AlarmOutcome outcome{.retry = false, .outcome = EventOutcome::OK};
-  kj::Function<kj::Promise<kj::Maybe<kj::Date>>()> onAbandon;
+  kj::Own<AlarmStubState> ownState;
+  AlarmStubState& state;
 };
+
+template <typename Func>
+void pollUntil(kj::WaitScope& waitScope, Func&& predicate) {
+  for (uint i = 0; i < 1000 && !predicate(); ++i) {
+    waitScope.poll();
+  }
+  KJ_ASSERT(predicate());
+}
+
+kj::Maybe<kj::Date> readStoredAlarm(
+    SqliteDatabase::Vfs& vfs, kj::PathPtr path, kj::StringPtr actorId) {
+  SqliteDatabase db(vfs, path.clone(), kj::WriteMode::MODIFY);
+  auto query = db.run("SELECT scheduled_time FROM _cf_ALARM WHERE actor_id = ?", actorId);
+  if (query.isDone()) return kj::none;
+  return kj::UNIX_EPOCH + query.getInt64(0) * kj::NANOSECONDS;
+}
+
+struct AlarmSchedulerTest {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope;
+  AdjustableClock clock;
+  kj::TimerImpl timer;
+  kj::Own<const kj::Directory> dir;
+  SqliteDatabase::Vfs vfs;
+  kj::Path path = kj::Path({"alarms"});
+  AlarmStubState state;
+  AlarmScheduler scheduler;
+
+  AlarmSchedulerTest()
+      : waitScope(loop),
+        timer(kj::origin<kj::TimePoint>()),
+        dir(kj::newInMemoryDirectory(kj::nullClock())),
+        vfs(*dir),
+        scheduler(clock, timer, vfs, path.clone(), [this](const ActorKey&) {
+          return kj::Own<WorkerInterface>(kj::heap<AlarmStubWorkerInterface>(state));
+        }) {}
+
+  void startAlarm(ActorKey actor, kj::Date scheduledTime) {
+    scheduler.setAlarm(actor, scheduledTime);
+    if (scheduledTime <= clock.now()) timer.advanceTo(timer.now());
+  }
+};
+
+KJ_TEST("AlarmScheduler begin revoke stops timers but accepts draining commit updates") {
+  AlarmSchedulerTest test;
+  auto actor = ActorKey{.actorId = "waiting"_kj};
+  auto deletedActor = ActorKey{.actorId = "deleted"_kj};
+  auto scheduledTime = kj::UNIX_EPOCH + 1 * kj::HOURS;
+  auto updatedTime = kj::UNIX_EPOCH + 2 * kj::HOURS;
+  test.startAlarm(actor, scheduledTime);
+  test.startAlarm(deletedActor, scheduledTime);
+  KJ_EXPECT(test.timer.nextEvent() != kj::none);
+
+  test.scheduler.beginRevoke(KJ_EXCEPTION(DISCONNECTED, "first revoke"));
+  KJ_EXPECT(test.timer.nextEvent() == kj::none);
+  KJ_EXPECT_THROW_MESSAGE("first revoke", test.scheduler.getAlarm(actor));
+  KJ_EXPECT_THROW_MESSAGE("first revoke", test.scheduler.deleteAll());
+  KJ_EXPECT(test.scheduler.setAlarm(actor, updatedTime));
+  KJ_EXPECT(test.scheduler.deleteAlarm(deletedActor));
+  KJ_EXPECT(readStoredAlarm(test.vfs, test.path, actor.actorId) == updatedTime);
+  KJ_EXPECT(readStoredAlarm(test.vfs, test.path, deletedActor.actorId) == kj::none);
+  KJ_EXPECT(test.timer.nextEvent() == kj::none);
+
+  test.scheduler.beginRevoke(KJ_EXCEPTION(DISCONNECTED, "second revoke"));
+  KJ_EXPECT_THROW_MESSAGE("first revoke", test.scheduler.getAlarm(actor));
+  KJ_EXPECT(test.scheduler.finishRevoke().poll(test.waitScope));
+}
+
+KJ_TEST("AlarmScheduler finish revoke closes storage while a started alarm drains") {
+  AlarmSchedulerTest test;
+  auto actor = ActorKey{.actorId = "started"_kj};
+  test.state.blockRun = true;
+  test.startAlarm(actor, kj::UNIX_EPOCH);
+  pollUntil(test.waitScope, [&]() { return test.state.runCount == 1; });
+
+  test.scheduler.beginRevoke(KJ_EXCEPTION(DISCONNECTED, "storage revoked"));
+  KJ_EXPECT(test.scheduler.hasAlarmForTest(actor));
+  auto drain = test.scheduler.finishRevoke();
+  KJ_EXPECT(!drain.poll(test.waitScope));
+  KJ_EXPECT(!test.state.runCanceled);
+  KJ_EXPECT_THROW_MESSAGE("storage revoked", test.scheduler.getStorageForTest().run("SELECT 1"));
+  KJ_EXPECT(readStoredAlarm(test.vfs, test.path, actor.actorId) == kj::UNIX_EPOCH);
+
+  test.state.finishRun();
+  drain.wait(test.waitScope);
+  KJ_EXPECT(!test.state.runCanceled);
+  KJ_EXPECT(readStoredAlarm(test.vfs, test.path, actor.actorId) == kj::UNIX_EPOCH);
+}
+
+KJ_TEST("AlarmScheduler revoke does not start a queued alarm") {
+  AlarmSchedulerTest test;
+  auto actor = ActorKey{.actorId = "queued"_kj};
+  auto queuedTime = kj::UNIX_EPOCH + 1 * kj::HOURS;
+  test.state.blockRun = true;
+  test.startAlarm(actor, kj::UNIX_EPOCH);
+  pollUntil(test.waitScope, [&]() { return test.state.runCount == 1; });
+  test.scheduler.setAlarm(actor, queuedTime);
+
+  test.scheduler.beginRevoke(KJ_EXCEPTION(DISCONNECTED, "storage revoked"));
+  KJ_EXPECT(test.timer.nextEvent() == kj::none);
+  auto drain = test.scheduler.finishRevoke();
+  test.state.finishRun();
+  drain.wait(test.waitScope);
+  KJ_EXPECT(readStoredAlarm(test.vfs, test.path, actor.actorId) == queuedTime);
+  KJ_EXPECT(test.timer.nextEvent() == kj::none);
+  KJ_EXPECT(test.state.runCount == 1);
+}
+
+KJ_TEST("AlarmScheduler revoke cancels an alarm waiting to retry") {
+  AlarmSchedulerTest test;
+  auto actor = ActorKey{.actorId = "retry"_kj};
+  test.state.outcome = {
+    .retry = true, .retryCountsAgainstLimit = true, .outcome = EventOutcome::EXCEPTION};
+  test.startAlarm(actor, kj::UNIX_EPOCH);
+  pollUntil(test.waitScope, [&]() { return test.state.runCount == 1; });
+  for (uint i = 0; i < 10; ++i) test.waitScope.poll();
+  KJ_EXPECT(test.timer.nextEvent() != kj::none);
+
+  test.scheduler.beginRevoke(KJ_EXCEPTION(DISCONNECTED, "storage revoked"));
+  KJ_EXPECT(test.timer.nextEvent() == kj::none);
+  auto drain = test.scheduler.finishRevoke();
+  KJ_EXPECT(drain.poll(test.waitScope));
+  KJ_EXPECT(test.state.runCount == 1);
+  KJ_EXPECT(readStoredAlarm(test.vfs, test.path, actor.actorId) == kj::UNIX_EPOCH);
+}
+
+KJ_TEST("AlarmScheduler revoke during terminal cleanup retains the alarm") {
+  AlarmSchedulerTest test;
+  auto actor = ActorKey{.actorId = "terminal"_kj};
+  test.state.outcome = {
+    .retry = true, .retryCountsAgainstLimit = true, .outcome = EventOutcome::EXCEPTION};
+  test.state.blockAbandon = true;
+  test.startAlarm(actor, kj::UNIX_EPOCH);
+
+  pollUntil(test.waitScope, [&]() { return test.state.runCount == 1; });
+  for (uint expected = 2; expected <= AlarmScheduler::RETRY_MAX_TRIES + 1; ++expected) {
+    test.clock.setTime(test.clock.now() + 1 * kj::HOURS);
+    test.timer.advanceTo(test.timer.now() + 1 * kj::HOURS);
+    pollUntil(test.waitScope, [&]() { return test.state.runCount == expected; });
+  }
+  pollUntil(test.waitScope, [&]() { return test.state.abandonCount == 1; });
+
+  test.scheduler.beginRevoke(KJ_EXCEPTION(DISCONNECTED, "storage revoked"));
+  KJ_EXPECT(test.scheduler.hasAlarmForTest(actor));
+  KJ_EXPECT(!test.state.abandonCanceled);
+  test.state.finishAbandon();
+  pollUntil(test.waitScope, [&]() { return !test.scheduler.hasActiveAlarmTasksForTest(); });
+  KJ_EXPECT(!test.state.abandonCanceled);
+  KJ_EXPECT(test.scheduler.hasAlarmForTest(actor));
+  KJ_EXPECT(readStoredAlarm(test.vfs, test.path, actor.actorId) == kj::UNIX_EPOCH);
+  KJ_EXPECT(test.scheduler.finishRevoke().poll(test.waitScope));
+}
+
+KJ_TEST("AlarmScheduler repeated finish revoke shares the pending drain") {
+  AlarmSchedulerTest test;
+  auto actor = ActorKey{.actorId = "idempotent"_kj};
+  test.state.blockRun = true;
+  test.startAlarm(actor, kj::UNIX_EPOCH);
+  pollUntil(test.waitScope, [&]() { return test.state.runCount == 1; });
+
+  test.scheduler.beginRevoke(KJ_EXCEPTION(DISCONNECTED, "storage revoked"));
+  auto first = test.scheduler.finishRevoke();
+  auto second = test.scheduler.finishRevoke();
+  KJ_EXPECT(!first.poll(test.waitScope));
+  KJ_EXPECT(!second.poll(test.waitScope));
+
+  test.state.finishRun();
+  first.wait(test.waitScope);
+  second.wait(test.waitScope);
+}
+
+KJ_TEST("AlarmScheduler deleteAll cancels a started alarm") {
+  AlarmSchedulerTest test;
+  auto actor = ActorKey{.actorId = "delete-all"_kj};
+  test.state.blockRun = true;
+  test.startAlarm(actor, kj::UNIX_EPOCH);
+  pollUntil(test.waitScope, [&]() { return test.state.runCount == 1; });
+
+  test.scheduler.deleteAll();
+  KJ_EXPECT(test.state.runCanceled);
+  KJ_EXPECT(readStoredAlarm(test.vfs, test.path, actor.actorId) == kj::none);
+  test.waitScope.poll();
+}
 
 KJ_TEST("AlarmScheduler migrates a database created before the actor_name column existed") {
   kj::EventLoop loop;
@@ -210,9 +452,11 @@ KJ_TEST("AlarmScheduler restores the persisted actor_name onto the ActorKey when
   // A fresh scheduler must reload the alarm (and its name) from disk.
   kj::Maybe<kj::String> observedName;
   bool fired = false;
+  AlarmStubState state;
+  state.onRun = [&fired]() { fired = true; };
   auto getActor = [&](const ActorKey& actor) -> kj::Own<WorkerInterface> {
     observedName = actor.name.map([](kj::StringPtr n) { return kj::str(n); });
-    return kj::heap<AlarmStubWorkerInterface>([&fired]() { fired = true; });
+    return kj::heap<AlarmStubWorkerInterface>(state);
   };
 
   AlarmScheduler scheduler(clock, timer, vfs, path.clone(), kj::mv(getActor));
