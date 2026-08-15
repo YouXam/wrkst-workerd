@@ -100,6 +100,7 @@ void AlarmScheduler::loadAlarmsFromDb() {
 }
 
 kj::Maybe<kj::Date> AlarmScheduler::getAlarm(ActorKey actor) {
+  requireActive();
   // TODO(someday): Might be able to simplify AlarmScheduler somewhat, now that ActorSqlite no
   // longer relies on it for getAlarm()?
   KJ_IF_SOME(alarm, alarms.find(actor)) {
@@ -117,12 +118,14 @@ kj::Maybe<kj::Date> AlarmScheduler::getAlarm(ActorKey actor) {
 }
 
 bool AlarmScheduler::setAlarm(ActorKey actor, kj::Date scheduledTime) {
+  requireNotRevoked();
   int64_t scheduledTimeNs = (scheduledTime - kj::UNIX_EPOCH) / kj::NANOSECONDS;
   SqliteDatabase::Query::ValuePtr nameParam = nullptr;
   KJ_IF_SOME(n, actor.name) {
     nameParam = n;
   }
   auto query = stmtSetAlarm.run(actor.actorId, scheduledTimeNs, nameParam);
+  if (state == State::REVOKING) return query.changeCount() > 0;
 
   bool existing = true;
   auto& entry = alarms.findOrCreate(actor, [&]() {
@@ -148,14 +151,17 @@ bool AlarmScheduler::setAlarm(ActorKey actor, kj::Date scheduledTime) {
 }
 
 void AlarmScheduler::deleteAll() {
-  // Cancel all in-memory alarm tasks.
+  requireActive();
+  tasks.clear();
   alarms.clear();
   // Wipe the persistent store.
   db->run("DELETE FROM _cf_ALARM;");
 }
 
 bool AlarmScheduler::deleteAlarm(ActorKey actor) {
+  requireNotRevoked();
   auto query = stmtDeleteAlarm.run(actor.actorId);
+  if (state == State::REVOKING) return query.changeCount() > 0;
 
   KJ_IF_SOME(entry, alarms.findEntry(actor)) {
     KJ_IF_SOME(queued, entry.value.queuedAlarm) {
@@ -174,6 +180,26 @@ bool AlarmScheduler::deleteAlarm(ActorKey actor) {
   }
 
   return query.changeCount() > 0;
+}
+
+void AlarmScheduler::beginRevoke(kj::Exception reason) {
+  if (state != State::ACTIVE) return;
+  revokeReason = kj::mv(reason);
+  state = State::REVOKING;
+  alarms.eraseAll([](const ActorKey&, ScheduledAlarm& alarm) { return !alarm.taskStarted; });
+}
+
+kj::Promise<void> AlarmScheduler::finishRevoke() {
+  KJ_IF_SOME(task, revokeTask) {
+    return task.addBranch();
+  }
+  KJ_REQUIRE(state == State::REVOKING, "beginRevoke() must be called before finishRevoke()");
+  db->close(KJ_ASSERT_NONNULL(revokeReason).clone());
+  state = State::REVOKED;
+  auto task = tasks.onEmpty().fork();
+  auto result = task.addBranch();
+  revokeTask = kj::mv(task);
+  return result;
 }
 
 AlarmScheduler::ScheduledAlarm AlarmScheduler::scheduleAlarm(
@@ -200,10 +226,15 @@ kj::Promise<void> AlarmScheduler::checkTimestamp(kj::Duration delay, kj::Date sc
 kj::Promise<void> AlarmScheduler::makeAlarmTask(
     kj::Duration delay, const ActorKey& actorRef, kj::Date scheduledTime) {
   co_await checkTimestamp(delay, scheduledTime);
+  if (state != State::ACTIVE) co_return;
   uint32_t retryCount = 0;
   {
     auto& entry = KJ_ASSERT_NONNULL(alarms.findEntry(actorRef));
     entry.value.status = AlarmStatus::STARTED;
+    entry.value.taskStarted = true;
+    auto task = kj::mv(entry.value.task).fork();
+    entry.value.task = task.addBranch();
+    tasks.add(task.addBranch());
     retryCount = entry.value.countedRetry;
   }
 
@@ -227,12 +258,10 @@ kj::Promise<void> AlarmScheduler::makeAlarmTask(
     }
   })();
 
+  if (state != State::ACTIVE) co_return;
+
   try {
     auto& entry = KJ_ASSERT_NONNULL(alarms.findEntry(actorRef));
-
-    // We can't overwrite our entry before moving ourselves out of it, as a promise cannot
-    // delete itself.
-    tasks.add(kj::mv(entry.value.task));
 
     // If an alarm is queued, there's no point in retrying the current one -- proceed
     // to running the queued alarm instead.
@@ -257,7 +286,9 @@ kj::Promise<void> AlarmScheduler::makeAlarmTask(
         // already has visibility into the actor's alarm state via its SQLite hooks.
         // If the notification fails, we keep the alarm in the scheduler so it is not silently
         // lost.
-        entry.value.task = abandonAlarm(actorRef.clone(), scheduledTime);
+        auto abandon = abandonAlarm(actorRef.clone(), scheduledTime).fork();
+        tasks.add(abandon.addBranch());
+        entry.value.task = abandon.addBranch();
         co_return;
       }
       if (alarmOutcome.retryCountsAgainstLimit) {
@@ -284,11 +315,14 @@ kj::Promise<void> AlarmScheduler::makeAlarmTask(
       entry.value.backoff++;
       entry.value.retry++;
 
+      entry.value.taskStarted = false;
       entry.value.task = makeAlarmTask(delay, actorRef, scheduledTime);
     } else {
       KJ_ASSERT(entry.value.queuedAlarm == kj::none);
       if (alarmOutcome.outcome == EventOutcome::ABORTED) {
-        entry.value.task = abandonAlarm(actorRef.clone(), scheduledTime);
+        auto abandon = abandonAlarm(actorRef.clone(), scheduledTime).fork();
+        tasks.add(abandon.addBranch());
+        entry.value.task = abandon.addBranch();
         co_return;
       }
       deleteAlarm(actorRef);
@@ -308,6 +342,8 @@ kj::Promise<void> AlarmScheduler::abandonAlarm(kj::Own<ActorKey> actor, kj::Date
     co_return;
   }
 
+  if (state != State::ACTIVE) co_return;
+
   KJ_IF_SOME(entry, alarms.findEntry(*actor)) {
     if (entry.value.status != AlarmStatus::FINISHED || entry.value.scheduledTime != scheduledTime) {
       co_return;
@@ -326,6 +362,18 @@ kj::Promise<void> AlarmScheduler::abandonAlarm(kj::Own<ActorKey> actor, kj::Date
 
 void AlarmScheduler::taskFailed(kj::Exception&& e) {
   KJ_LOG(WARNING, e);
+}
+
+void AlarmScheduler::requireActive() {
+  if (state != State::ACTIVE) {
+    kj::throwFatalException(KJ_ASSERT_NONNULL(revokeReason).clone());
+  }
+}
+
+void AlarmScheduler::requireNotRevoked() {
+  if (state == State::REVOKED) {
+    kj::throwFatalException(KJ_ASSERT_NONNULL(revokeReason).clone());
+  }
 }
 
 }  // namespace workerd::server
