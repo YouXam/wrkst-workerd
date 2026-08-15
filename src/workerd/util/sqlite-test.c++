@@ -5,6 +5,7 @@
 #include "sqlite.h"
 
 #include <fcntl.h>
+#include <sqlite3.h>
 
 #include <kj/refcount.h>
 #include <kj/test.h>
@@ -102,6 +103,11 @@ void checkSql(SqliteDatabase& db) {
     query.nextRow();
     KJ_EXPECT(query.isDone());
   }
+}
+
+int denyRollback(void*, int actionCode, const char* param1, const char*, const char*, const char*) {
+  return actionCode == SQLITE_TRANSACTION && kj::StringPtr(param1) == "ROLLBACK"_kj ? SQLITE_DENY
+                                                                                    : SQLITE_OK;
 }
 
 class DefaultRegulatorForTest: public SqliteDatabase::Regulator {
@@ -1234,6 +1240,363 @@ KJ_TEST("SQLite onRollback") {
   }
 }
 
+KJ_TEST("permanently closing a database invalidates access") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+  db.run("CREATE TABLE things (id INTEGER PRIMARY KEY)");
+  db.run("INSERT INTO things VALUES (123)");
+
+  auto stmt = db.prepare("SELECT * FROM things");
+  auto query = stmt.run();
+  KJ_ASSERT(!query.isDone());
+  KJ_EXPECT(query.getInt(0) == 123);
+
+  bool afterResetCalled = false;
+  db.afterReset([&](SqliteDatabase&) { afterResetCalled = true; });
+  db.close(KJ_EXCEPTION(DISCONNECTED, "database closed for lease handoff"));
+
+  KJ_EXPECT(!afterResetCalled);
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", query.isDone());
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", query.nextRow());
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", query.getInt(0));
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", stmt.run());
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", db.prepare("SELECT 1"));
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", db.run("SELECT 1"));
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", db.notifyWrite());
+  KJ_EXPECT_THROW_MESSAGE(
+      "database closed for lease handoff", db.ingestSql(SqliteDatabase::TRUSTED, "SELECT"_kj));
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff",
+      db.executeWithRegulator(SqliteDatabase::TRUSTED, []() {}));
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", static_cast<sqlite3*>(db));
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", db.reset());
+
+  auto lazy = db.prepareMulti(SqliteDatabase::TRUSTED, kj::str("SELECT 1"));
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", lazy.run());
+  KJ_EXPECT_THROW_MESSAGE(
+      "database closed for lease handoff", db.close(KJ_EXCEPTION(FAILED, "different reason")));
+}
+
+KJ_TEST("permanent close preserves committed WAL") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+
+  {
+    SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+    db.run("PRAGMA journal_mode=WAL");
+    db.run("CREATE TABLE things (id INTEGER PRIMARY KEY)");
+    db.run("INSERT INTO things VALUES (123)");
+    KJ_EXPECT(dir->exists(kj::Path({"foo-wal"})));
+
+    db.close(KJ_EXCEPTION(DISCONNECTED, "database closed for lease handoff"));
+    KJ_EXPECT(dir->exists(kj::Path({"foo-wal"})));
+  }
+
+  SqliteDatabase reopened(vfs, kj::Path({"foo"}), kj::WriteMode::MODIFY);
+  KJ_EXPECT(reopened.run("SELECT id FROM things").getInt(0) == 123);
+}
+
+KJ_TEST("permanently closing a database rolls back a transaction") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  bool rollbackCalled = false;
+
+  {
+    SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+    db.run("CREATE TABLE things (id INTEGER PRIMARY KEY)");
+    db.run("INSERT INTO things VALUES (1)");
+    db.run("BEGIN TRANSACTION");
+    db.run("INSERT INTO things VALUES (2)");
+    db.onRollback([&]() {
+      rollbackCalled = true;
+      KJ_EXPECT(db.run("SELECT COUNT(*) FROM things").getInt(0) == 1);
+    });
+
+    db.close(KJ_EXCEPTION(DISCONNECTED, "database closed for lease handoff"));
+    KJ_EXPECT(rollbackCalled);
+  }
+
+  SqliteDatabase reopened(vfs, kj::Path({"foo"}), kj::WriteMode::MODIFY);
+  KJ_EXPECT(reopened.run("SELECT COUNT(*) FROM things").getInt(0) == 1);
+  KJ_EXPECT(reopened.run("SELECT id FROM things").getInt(0) == 1);
+}
+
+KJ_TEST("permanently closing a database rolls back a root savepoint") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  bool rollbackCalled = false;
+
+  {
+    SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+    db.run("CREATE TABLE things (id INTEGER PRIMARY KEY)");
+    db.run("INSERT INTO things VALUES (1)");
+    db.run("SAVEPOINT root");
+    db.run("INSERT INTO things VALUES (2)");
+    db.onRollback([&]() {
+      rollbackCalled = true;
+      KJ_EXPECT(db.run("SELECT COUNT(*) FROM things").getInt(0) == 1);
+    });
+
+    db.close(KJ_EXCEPTION(DISCONNECTED, "database closed for lease handoff"));
+    KJ_EXPECT(rollbackCalled);
+  }
+
+  SqliteDatabase reopened(vfs, kj::Path({"foo"}), kj::WriteMode::MODIFY);
+  KJ_EXPECT(reopened.run("SELECT COUNT(*) FROM things").getInt(0) == 1);
+  KJ_EXPECT(reopened.run("SELECT id FROM things").getInt(0) == 1);
+}
+
+KJ_TEST("permanent close rejects rollback callback reentry") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+  db.run("BEGIN TRANSACTION");
+  db.onRollback([&]() {
+    KJ_EXPECT_THROW_MESSAGE(
+        "database connection is already being closed", db.close(KJ_EXCEPTION(FAILED, "nested")));
+    KJ_EXPECT_THROW_MESSAGE("database connection is already being closed", db.reset());
+  });
+
+  db.close(KJ_EXCEPTION(DISCONNECTED, "database closed for lease handoff"));
+  KJ_EXPECT_THROW_MESSAGE("database closed for lease handoff", db.run("SELECT 1"));
+}
+
+KJ_TEST("permanent close completes when a rollback callback throws") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+  db.run("CREATE TABLE things (id INTEGER PRIMARY KEY)");
+  db.run("BEGIN TRANSACTION");
+  db.run("INSERT INTO things VALUES (1)");
+
+  bool laterCallbackCalled = false;
+  db.onRollback([&]() { laterCallbackCalled = true; });
+  db.onRollback([&]() { KJ_FAIL_REQUIRE("rollback callback failed"); });
+
+  KJ_EXPECT_THROW_MESSAGE(
+      "rollback callback failed", db.close(KJ_EXCEPTION(DISCONNECTED, "database closed")));
+  KJ_EXPECT(laterCallbackCalled);
+  KJ_EXPECT_THROW_MESSAGE("database closed", db.run("SELECT 1"));
+
+  SqliteDatabase reopened(vfs, kj::Path({"foo"}), kj::WriteMode::MODIFY);
+  KJ_EXPECT(reopened.run("SELECT COUNT(*) FROM things").getInt(0) == 0);
+}
+
+KJ_TEST("permanent close completes after rollback failure") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+  db.run("CREATE TABLE things (id INTEGER PRIMARY KEY)");
+  db.run("BEGIN TRANSACTION");
+  db.run("INSERT INTO things VALUES (1)");
+
+  sqlite3* handle = db;
+  KJ_ASSERT(sqlite3_set_authorizer(handle, denyRollback, nullptr) == SQLITE_OK);
+  bool rollbackCalled = false;
+  db.onRollback([&]() { rollbackCalled = true; });
+
+  KJ_EXPECT_THROW_MESSAGE(
+      "not authorized: SQLITE_AUTH", db.close(KJ_EXCEPTION(DISCONNECTED, "database closed")));
+  KJ_EXPECT(rollbackCalled);
+  KJ_EXPECT_THROW_MESSAGE("database closed", db.run("SELECT 1"));
+}
+
+KJ_TEST("permanent close preserves rollback failure across a busy retry") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+  db.run("CREATE TABLE things (id INTEGER PRIMARY KEY)");
+  db.run("BEGIN TRANSACTION");
+  db.run("INSERT INTO things VALUES (1)");
+
+  sqlite3* handle = db;
+  sqlite3_stmt* rawStatement = nullptr;
+  db.executeWithRegulator(SqliteDatabase::TRUSTED, [&]() {
+    KJ_ASSERT(sqlite3_prepare_v2(handle, "SELECT 1", -1, &rawStatement, nullptr) == SQLITE_OK);
+  });
+  KJ_ASSERT(sqlite3_set_authorizer(handle, denyRollback, nullptr) == SQLITE_OK);
+  bool rollbackCalled = false;
+  db.onRollback([&]() {
+    rollbackCalled = true;
+    KJ_EXPECT(db.run("SELECT COUNT(*) FROM things").getInt(0) == 0);
+  });
+
+  KJ_EXPECT_THROW_MESSAGE("can't close database because dependent objects still exist",
+      db.close(KJ_EXCEPTION(DISCONNECTED, "unused close reason")));
+  KJ_EXPECT(!rollbackCalled);
+
+  KJ_ASSERT(sqlite3_finalize(rawStatement) == SQLITE_OK);
+  KJ_ASSERT(sqlite3_set_authorizer(handle, nullptr, nullptr) == SQLITE_OK);
+  KJ_EXPECT_THROW_MESSAGE("not authorized: SQLITE_AUTH",
+      db.close(KJ_EXCEPTION(DISCONNECTED, "database closed after retry")));
+  KJ_EXPECT(rollbackCalled);
+  KJ_EXPECT_THROW_MESSAGE("database closed after retry", db.run("SELECT 1"));
+}
+
+KJ_TEST("permanent close preserves callback failure across a busy retry") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+  db.run("BEGIN TRANSACTION");
+  db.onRollback([&]() { KJ_FAIL_REQUIRE("rollback callback failed"); });
+
+  sqlite3* handle = db;
+  sqlite3_stmt* rawStatement = nullptr;
+  db.executeWithRegulator(SqliteDatabase::TRUSTED, [&]() {
+    KJ_ASSERT(sqlite3_prepare_v2(handle, "SELECT 1", -1, &rawStatement, nullptr) == SQLITE_OK);
+  });
+
+  KJ_EXPECT_THROW_MESSAGE("can't close database because dependent objects still exist",
+      db.close(KJ_EXCEPTION(DISCONNECTED, "unused close reason")));
+  KJ_ASSERT(sqlite3_finalize(rawStatement) == SQLITE_OK);
+  KJ_EXPECT_THROW_MESSAGE("rollback callback failed",
+      db.close(KJ_EXCEPTION(DISCONNECTED, "database closed after retry")));
+  KJ_EXPECT_THROW_MESSAGE("database closed after retry", db.run("SELECT 1"));
+}
+
+KJ_TEST("failed permanent close restores checkpoint setting") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+  sqlite3* handle = db;
+  sqlite3_stmt* rawStatement = nullptr;
+  db.executeWithRegulator(SqliteDatabase::TRUSTED, [&]() {
+    KJ_ASSERT(sqlite3_prepare_v2(handle, "SELECT 1", -1, &rawStatement, nullptr) == SQLITE_OK);
+  });
+
+  for (int previous: {0, 1}) {
+    KJ_ASSERT(sqlite3_db_config(handle, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, previous, nullptr) ==
+        SQLITE_OK);
+    KJ_EXPECT_THROW_MESSAGE("can't close database because dependent objects still exist",
+        db.close(KJ_EXCEPTION(DISCONNECTED, "unused close reason")));
+
+    int restored = -1;
+    KJ_ASSERT(
+        sqlite3_db_config(handle, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, -1, &restored) == SQLITE_OK);
+    KJ_EXPECT(restored == previous);
+  }
+
+  KJ_ASSERT(sqlite3_finalize(rawStatement) == SQLITE_OK);
+  db.close(KJ_EXCEPTION(DISCONNECTED, "database closed after retry"));
+}
+
+KJ_TEST("reset rejects connection teardown reentry") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+  class ReentrantListener final: public SqliteDatabase::ResetListener {
+   public:
+    explicit ReentrantListener(SqliteDatabase& db): ResetListener(db) {}
+
+    void beforeSqliteReset() override {
+      KJ_EXPECT_THROW_MESSAGE("database connection is already being closed", db.reset());
+      KJ_EXPECT_THROW_MESSAGE(
+          "database connection is already being closed", db.close(KJ_EXCEPTION(FAILED, "nested")));
+    }
+  } listener(db);
+
+  db.reset();
+  KJ_EXPECT(db.run("SELECT 1").getInt(0) == 1);
+}
+
+KJ_TEST("permanent close invalidates statements after reset initialization fails") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  kj::Maybe<SqliteDatabase::Statement> retainedStatement;
+
+  db.afterReset([&](SqliteDatabase& resetDb) {
+    resetDb.run("CREATE TABLE things (id INTEGER PRIMARY KEY)");
+    retainedStatement = resetDb.prepare("INSERT INTO things VALUES (1)");
+    KJ_FAIL_REQUIRE("reset initialization failed");
+  });
+
+  KJ_EXPECT_THROW_MESSAGE("reset initialization failed", db.reset());
+  db.close(KJ_EXCEPTION(DISCONNECTED, "database closed after failed reset"));
+
+  KJ_EXPECT_THROW_MESSAGE(
+      "database closed after failed reset", KJ_ASSERT_NONNULL(retainedStatement).run());
+  KJ_EXPECT_THROW_MESSAGE("database closed after failed reset", db.reset());
+}
+
+KJ_TEST("failed reset invalidates statements after rollback failure") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  kj::Maybe<SqliteDatabase::Statement> retainedStatement;
+
+  db.afterReset([&](SqliteDatabase& resetDb) {
+    resetDb.run("CREATE TABLE things (id INTEGER PRIMARY KEY)");
+    resetDb.run("BEGIN TRANSACTION");
+    retainedStatement = resetDb.prepare("SELECT * FROM things");
+    sqlite3* handle = resetDb;
+    KJ_ASSERT(sqlite3_set_authorizer(handle, denyRollback, nullptr) == SQLITE_OK);
+    KJ_FAIL_REQUIRE("reset initialization failed");
+  });
+
+  KJ_EXPECT_LOG(ERROR, "failed to roll back database after reset initialization failed");
+  KJ_EXPECT_THROW_MESSAGE("reset initialization failed", db.reset());
+  KJ_EXPECT_THROW_MESSAGE("previous reset() failed", KJ_ASSERT_NONNULL(retainedStatement).run());
+
+  db.close(KJ_EXCEPTION(DISCONNECTED, "database closed after failed reset"));
+  KJ_EXPECT_THROW_MESSAGE(
+      "database closed after failed reset", KJ_ASSERT_NONNULL(retainedStatement).run());
+}
+
+KJ_TEST("failed reset rolls back callback state") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  bool rollbackCalled = false;
+
+  db.afterReset([&](SqliteDatabase& resetDb) {
+    resetDb.run("BEGIN TRANSACTION");
+    resetDb.onRollback([&]() { rollbackCalled = true; });
+    KJ_FAIL_REQUIRE("reset initialization failed");
+  });
+
+  KJ_EXPECT_THROW_MESSAGE("reset initialization failed", db.reset());
+  KJ_EXPECT(rollbackCalled);
+
+  db.afterReset([](SqliteDatabase&) {});
+  db.reset();
+  KJ_EXPECT(db.run("SELECT 1").getInt(0) == 1);
+}
+
+KJ_TEST("failed reset preserves a busy connection for close retry") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"foo"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  sqlite3_stmt* rawStatement = nullptr;
+
+  db.afterReset([&](SqliteDatabase& resetDb) {
+    sqlite3* handle = resetDb;
+    resetDb.executeWithRegulator(SqliteDatabase::TRUSTED, [&]() {
+      KJ_ASSERT(sqlite3_prepare_v2(handle, "SELECT 1", -1, &rawStatement, nullptr) == SQLITE_OK);
+    });
+    KJ_FAIL_REQUIRE("reset initialization failed");
+  });
+
+  KJ_EXPECT_LOG(ERROR, "failed to close database after reset initialization failed");
+  KJ_EXPECT_THROW_MESSAGE("reset initialization failed", db.reset());
+  KJ_EXPECT_THROW_MESSAGE("previous reset() failed", db.run("SELECT 1"));
+  KJ_EXPECT_THROW_MESSAGE("can't close database because dependent objects still exist",
+      db.close(KJ_EXCEPTION(DISCONNECTED, "unused close reason")));
+  KJ_EXPECT_THROW_MESSAGE("previous reset() failed", db.run("SELECT 1"));
+
+  KJ_ASSERT(sqlite3_finalize(rawStatement) == SQLITE_OK);
+  db.close(KJ_EXCEPTION(DISCONNECTED, "database closed after retry"));
+  KJ_EXPECT_THROW_MESSAGE("database closed after retry", db.run("SELECT 1"));
+}
+
 KJ_TEST("SQLite prepareMulti") {
   auto dir = kj::newInMemoryDirectory(kj::nullClock());
   SqliteDatabase::Vfs vfs(*dir);
@@ -1504,6 +1867,7 @@ class ErrorInjectableDirectory final: public kj::Directory, public kj::AtomicRef
   kj::Maybe<kj::Own<ErrorInjectableFile>> dbFile;
   kj::Maybe<kj::Own<ErrorInjectableFile>> walFile;
   kj::Maybe<kj::Own<ErrorInjectableFile>> journalFile;
+  mutable kj::Maybe<kj::Exception> removeError;
 
   // Map filenames to the three Maybe<File>s above.
   kj::Maybe<kj::Own<ErrorInjectableFile>>& getSlot(kj::PathPtr path) {
@@ -1556,6 +1920,9 @@ class ErrorInjectableDirectory final: public kj::Directory, public kj::AtomicRef
   }
 
   bool tryRemove(kj::PathPtr path) const override {
+    KJ_IF_SOME(error, removeError) {
+      kj::throwFatalException(error.clone());
+    }
     auto& slot = getSlot(path);
     bool result = slot != kj::none;
     slot = kj::none;
@@ -1611,6 +1978,30 @@ class ErrorInjectableDirectory final: public kj::Directory, public kj::AtomicRef
     KJ_UNIMPLEMENTED("this method is unused by SQLite");
   }
 };
+
+KJ_TEST("reset discards a close error after closing the old connection") {
+  auto dir = kj::atomicRefcounted<ErrorInjectableDirectory>();
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+  db.run("BEGIN TRANSACTION");
+  db.onRollback([&]() { KJ_FAIL_REQUIRE("rollback callback failed"); });
+
+  sqlite3* handle = db;
+  sqlite3_stmt* rawStatement = nullptr;
+  db.executeWithRegulator(SqliteDatabase::TRUSTED, [&]() {
+    KJ_ASSERT(sqlite3_prepare_v2(handle, "SELECT 1", -1, &rawStatement, nullptr) == SQLITE_OK);
+  });
+  KJ_EXPECT_THROW_MESSAGE("can't close database because dependent objects still exist",
+      db.close(KJ_EXCEPTION(DISCONNECTED, "unused close reason")));
+
+  KJ_ASSERT(sqlite3_finalize(rawStatement) == SQLITE_OK);
+  dir->removeError = KJ_EXCEPTION(FAILED, "remove failed");
+  KJ_EXPECT_THROW_MESSAGE("remove failed", db.reset());
+
+  db.close(KJ_EXCEPTION(DISCONNECTED, "database closed after failed reset"));
+  KJ_EXPECT_THROW_MESSAGE("database closed after failed reset", db.run("SELECT 1"));
+}
 
 KJ_TEST("SQLite memory metering enforces SQLITE_NOMEM when limit is exceeded") {
   auto dir = kj::newInMemoryDirectory(kj::nullClock());
