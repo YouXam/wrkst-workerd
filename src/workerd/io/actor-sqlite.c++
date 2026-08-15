@@ -75,7 +75,7 @@ ActorSqlite::ImplicitTxn::~ImplicitTxn() noexcept(false) {
       parent.currentTxn.init<NoTxn>();
     }
   }
-  if (!committed && parent.broken == kj::none) {
+  if (!committed && parent.broken == kj::none && parent.storageRevokeReason == kj::none) {
     // Failed to commit, so roll back.
     //
     // This should only happen in cases of catastrophic error. Since this is rarely actually
@@ -168,7 +168,7 @@ ActorSqlite::ExplicitTxn::~ExplicitTxn() noexcept(false) {
     }
   }(););
 
-  if (!committed && actorSqlite.broken == kj::none) {
+  if (!committed && actorSqlite.broken == kj::none && actorSqlite.storageRevokeReason == kj::none) {
     // Assume rollback if not committed.
     rollbackImpl();
   }
@@ -198,7 +198,8 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::ExplicitTxn::commit() {
     return actorSqlite.blockTasks.onEmpty().then([this]() {
       commitImpl();
     }).catch_([self = kj::addRef(*this)](kj::Exception&& e) mutable {
-      if (self->actorSqlite.broken == kj::none) {
+      if (self->actorSqlite.broken == kj::none &&
+          self->actorSqlite.storageRevokeReason == kj::none) {
         self->rollbackImpl();
       }
       kj::throwFatalException(kj::mv(e));
@@ -212,7 +213,7 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::ExplicitTxn::commit() {
 }
 
 void ActorSqlite::ExplicitTxn::commitImpl() {
-  actorSqlite.requireNotBroken();
+  actorSqlite.requireStorageActive();
   KJ_REQUIRE(!hasChild,
       "critical sections should have prevented committing transaction while "
       "nested txn is outstanding");
@@ -267,7 +268,7 @@ void ActorSqlite::ExplicitTxn::commitImpl() {
 }
 
 kj::Promise<void> ActorSqlite::ExplicitTxn::rollback() {
-  actorSqlite.requireNotBroken();
+  actorSqlite.requireStorageActive();
   JSG_REQUIRE(!hasChild, Error,
       "Cannot roll back an outer transaction while a nested transaction is still running.");
   if (!committed) {
@@ -311,7 +312,7 @@ void ActorSqlite::onCriticalError(
 }
 
 void ActorSqlite::blockTransaction(kj::Promise<void> promise) {
-  requireNotBroken();
+  requireStorageActive();
 
   // Start a transaction if one isn't already open. (You might argue that we should call onWrite(),
   // but externalTransaction() itself isn't actually a write, though writes are expected to happen
@@ -328,6 +329,28 @@ void ActorSqlite::blockTransaction(kj::Promise<void> promise) {
     // go ahead and break the output gate! (Also, `taskFailed()` expects us to have done this.)
     return outputGate.lockWhile(kj::Promise<void>(kj::mv(e)), nullptr);
   }));
+}
+
+kj::Maybe<kj::Promise<void>> ActorSqlite::revokeStorage(kj::Exception reason) {
+  KJ_IF_SOME(task, storageRevokeTask) {
+    return task.addBranch();
+  }
+
+  storageRevokeReason = reason.clone();
+  if (!blockTasks.isEmpty()) {
+    abortImplicitTxnForRevoke = currentTxn.is<ImplicitTxn*>();
+    blockTasks.clear();
+  }
+
+  auto task = revokeStorageImpl().fork();
+  auto result = task.addBranch();
+  storageRevokeTask = kj::mv(task);
+  return result;
+}
+
+kj::Promise<void> ActorSqlite::revokeStorageImpl() {
+  co_await commitTasks.onEmpty();
+  db->close(KJ_ASSERT_NONNULL(storageRevokeReason).clone());
 }
 
 void ActorSqlite::startImplicitTxn() {
@@ -358,6 +381,11 @@ kj::Promise<void> ActorSqlite::startImplicitTxnImpl(kj::Own<ImplicitTxn> txn) {
   // If there were tasks blocking the transaction, wait for them.
   if (!blockTasks.isEmpty()) {
     co_await blockTasks.onEmpty();
+  }
+
+  if (abortImplicitTxnForRevoke) {
+    abortImplicitTxnForRevoke = false;
+    kj::throwFatalException(KJ_ASSERT_NONNULL(storageRevokeReason).clone());
   }
 
   // Don't commit if shutdown() has been called, or if one of the blockTasks threw, or we broke
@@ -660,7 +688,25 @@ void ActorSqlite::requireNotBroken() {
   }
 }
 
+void ActorSqlite::requireStorageNotRevoked() {
+  KJ_IF_SOME(reason, storageRevokeReason) {
+    kj::throwFatalException(reason.clone());
+  }
+}
+
+void ActorSqlite::requireStorageActive() {
+  requireStorageNotRevoked();
+  requireNotBroken();
+}
+
 void ActorSqlite::maybeDeleteDeferredAlarm() {
+  if (storageRevokeReason != kj::none) {
+    inAlarmHandler = false;
+    haveDeferredDelete = false;
+    deferredAlarmSpan = nullptr;
+    return;
+  }
+
   if (!inAlarmHandler) {
     // Pretty sure this can't happen.
     LOG_WARNING_ONCE("expected to be in alarm handler when trying to delete alarm");
@@ -699,7 +745,7 @@ void ActorSqlite::maybeDeleteDeferredAlarm() {
 
 kj::OneOf<kj::Maybe<ActorCacheOps::Value>, kj::Promise<kj::Maybe<ActorCacheOps::Value>>>
 ActorSqlite::get(Key key, ReadOptions options) {
-  requireNotBroken();
+  requireStorageActive();
 
   kj::Maybe<ActorCacheOps::Value> result;
   kv.get(key, [&](ValuePtr value) { result = kj::heapArray(value); });
@@ -708,7 +754,7 @@ ActorSqlite::get(Key key, ReadOptions options) {
 
 kj::OneOf<ActorCacheOps::GetResultList, kj::Promise<ActorCacheOps::GetResultList>> ActorSqlite::get(
     kj::Array<Key> keys, ReadOptions options) {
-  requireNotBroken();
+  requireStorageActive();
 
   kj::Vector<KeyValuePair> results;
   for (auto& key: keys) {
@@ -721,7 +767,7 @@ kj::OneOf<ActorCacheOps::GetResultList, kj::Promise<ActorCacheOps::GetResultList
 
 kj::OneOf<kj::Maybe<kj::Date>, kj::Promise<kj::Maybe<kj::Date>>> ActorSqlite::getAlarm(
     ReadOptions options) {
-  requireNotBroken();
+  requireStorageActive();
 
   bool transactionAlarmDirty = false;
   KJ_IF_SOME(exp, currentTxn.tryGet<ExplicitTxn*>()) {
@@ -740,7 +786,7 @@ kj::OneOf<kj::Maybe<kj::Date>, kj::Promise<kj::Maybe<kj::Date>>> ActorSqlite::ge
 
 kj::OneOf<ActorCacheOps::GetResultList, kj::Promise<ActorCacheOps::GetResultList>> ActorSqlite::
     list(Key begin, kj::Maybe<Key> end, kj::Maybe<uint> limit, ReadOptions options) {
-  requireNotBroken();
+  requireStorageActive();
 
   kj::Vector<KeyValuePair> results;
   kv.list(begin, end, limit, SqliteKv::FORWARD, [&](KeyPtr key, ValuePtr value) {
@@ -753,7 +799,7 @@ kj::OneOf<ActorCacheOps::GetResultList, kj::Promise<ActorCacheOps::GetResultList
 
 kj::OneOf<ActorCacheOps::GetResultList, kj::Promise<ActorCacheOps::GetResultList>> ActorSqlite::
     listReverse(Key begin, kj::Maybe<Key> end, kj::Maybe<uint> limit, ReadOptions options) {
-  requireNotBroken();
+  requireStorageActive();
 
   kj::Vector<KeyValuePair> results;
   kv.list(begin, end, limit, SqliteKv::REVERSE, [&](KeyPtr key, ValuePtr value) {
@@ -766,7 +812,7 @@ kj::OneOf<ActorCacheOps::GetResultList, kj::Promise<ActorCacheOps::GetResultList
 
 kj::Maybe<kj::Promise<void>> ActorSqlite::put(
     Key key, Value value, WriteOptions options, SpanParent traceSpan) {
-  requireNotBroken();
+  requireStorageActive();
   // Capture trace span for the output gate lock hold trace.
   currentCommitSpan = kj::mv(traceSpan);
   kv.put(key, value, {.allowUnconfirmed = options.allowUnconfirmed});
@@ -775,7 +821,7 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::put(
 
 kj::Maybe<kj::Promise<void>> ActorSqlite::put(
     kj::Array<KeyValuePair> pairs, WriteOptions options, SpanParent traceSpan) {
-  requireNotBroken();
+  requireStorageActive();
   // Capture trace span for the output gate lock hold trace.
   currentCommitSpan = kj::mv(traceSpan);
   if (currentTxn.is<NoTxn>()) {
@@ -793,7 +839,7 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::put(
 
 kj::OneOf<bool, kj::Promise<bool>> ActorSqlite::delete_(
     Key key, WriteOptions options, SpanParent traceSpan) {
-  requireNotBroken();
+  requireStorageActive();
   // Capture trace span for the output gate lock hold trace.
   currentCommitSpan = kj::mv(traceSpan);
 
@@ -802,7 +848,7 @@ kj::OneOf<bool, kj::Promise<bool>> ActorSqlite::delete_(
 
 kj::OneOf<uint, kj::Promise<uint>> ActorSqlite::delete_(
     kj::Array<Key> keys, WriteOptions options, SpanParent traceSpan) {
-  requireNotBroken();
+  requireStorageActive();
   // Capture trace span for the output gate lock hold trace.
   currentCommitSpan = kj::mv(traceSpan);
 
@@ -815,7 +861,7 @@ kj::OneOf<uint, kj::Promise<uint>> ActorSqlite::delete_(
 
 kj::Maybe<kj::Promise<void>> ActorSqlite::setAlarm(
     kj::Maybe<kj::Date> newAlarmTime, WriteOptions options, SpanParent traceSpan) {
-  requireNotBroken();
+  requireStorageActive();
   // Capture trace span for the output gate lock hold trace.
   currentCommitSpan = kj::mv(traceSpan);
 
@@ -843,7 +889,7 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::setAlarm(
 
 kj::OneOf<kj::Own<ActorCacheInterface::Transaction>, kj::Promise<void>> ActorSqlite::
     startTransaction() {
-  requireNotBroken();
+  requireStorageActive();
 
   KJ_IF_SOME(itxn, currentTxn.tryGet<ImplicitTxn*>()) {
     return itxn->waitForCompletion();
@@ -860,7 +906,7 @@ kj::OneOf<kj::Own<ActorCacheInterface::Transaction>, kj::Promise<void>> ActorSql
 
 ActorCacheInterface::DeleteAllResults ActorSqlite::deleteAll(
     WriteOptions options, SpanParent traceSpan, DeleteAllOptions deleteAllOptions) {
-  requireNotBroken();
+  requireStorageActive();
   disableAllowUnconfirmed(options, "deleteAll is not supported");
 
   // Capture trace span for the output gate lock (deleteAll always requires confirmation).
@@ -1004,6 +1050,7 @@ kj::OneOf<ActorSqlite::CancelAlarmHandler, ActorSqlite::RunAlarmHandler> ActorSq
         kj::Date currentTime,
         bool noCache,
         kj::StringPtr actorId) {
+  requireStorageNotRevoked();
   KJ_ASSERT(!inAlarmHandler);
 
   if (haveDeferredDelete) {
@@ -1112,6 +1159,7 @@ void ActorSqlite::cancelDeferredAlarmDeletion() {
 }
 
 kj::Promise<kj::Maybe<kj::Date>> ActorSqlite::abandonAlarm(kj::Date scheduledTime) {
+  requireStorageNotRevoked();
   // Called when AlarmManager has given up retrying an alarm after too many counted failures.
   // Clear the alarm from SQLite so getAlarm() returns null instead of a stale time.
   // Only clear if SQLite currently has the exact alarm being abandoned and we're not mid-handler.
@@ -1135,6 +1183,7 @@ kj::Promise<kj::Maybe<kj::Date>> ActorSqlite::abandonAlarm(kj::Date scheduledTim
 }
 
 kj::Maybe<kj::Promise<void>> ActorSqlite::onNoPendingFlush(SpanParent parentSpan) {
+  requireStorageNotRevoked();
   // This implements sync().
   //
   // sync() should wait for ALL writes (both confirmed and unconfirmed) that are outstanding at the
@@ -1157,7 +1206,7 @@ kj::Promise<kj::String> ActorSqlite::getCurrentBookmark(SpanParent parentSpan) {
   // * Bookmarks from the current workerd session sort after bookmarks from previous sessions.  We
   //   implement this by saving an ersatz bookmark in the SqliteMetadata table.
 
-  requireNotBroken();
+  requireStorageActive();
   uint64_t bookmark = 0;
   KJ_IF_SOME(b, metadata.getLocalDevelopmentBookmark()) {
     bookmark = b + 1;
@@ -1186,7 +1235,7 @@ kj::Promise<kj::String> ActorSqlite::getCurrentBookmark(SpanParent parentSpan) {
 
 kj::Promise<void> ActorSqlite::waitForBookmark(kj::StringPtr bookmark, SpanParent parentSpan) {
   // This is an ersatz implementation that's good enough for local dev with D1's Session API.
-  requireNotBroken();
+  requireStorageActive();
   return kj::READY_NOW;
 }
 
