@@ -594,6 +594,7 @@ SqliteDatabase::SqliteDatabase(const Vfs& vfs,
 }
 
 void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
+  throwIfClosed();
   KJ_ASSERT(maybeDb == kj::none);
   sqlite3* db = nullptr;
 
@@ -659,7 +660,21 @@ SqliteDatabase::~SqliteDatabase() noexcept(false) {
 }
 
 SqliteDatabase::operator sqlite3*() {
+  throwIfUnavailable();
   return &KJ_ASSERT_NONNULL(maybeDb, "previous reset() failed");
+}
+
+void SqliteDatabase::throwIfClosed() {
+  KJ_IF_SOME(reason, closedReason) {
+    kj::throwFatalException(reason.clone());
+  }
+}
+
+void SqliteDatabase::throwIfUnavailable() {
+  throwIfClosed();
+  KJ_IF_SOME(reason, resetFailure) {
+    kj::throwFatalException(reason.clone());
+  }
 }
 
 SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
@@ -671,6 +686,7 @@ bool SqliteDatabase::observedCriticalError() {
 }
 
 void SqliteDatabase::notifyWrite(bool allowUnconfirmed) {
+  throwIfUnavailable();
   KJ_IF_SOME(cb, onWriteCallback) {
     cb(allowUnconfirmed);
   }
@@ -800,6 +816,7 @@ SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(StaticRegulator re
     uint prepFlags,
     Multi multi,
     kj::Maybe<kj::Vector<Statement>&> prelude) {
+  throwIfUnavailable();
   sqlite3* db = &KJ_ASSERT_NONNULL(maybeDb, "previous reset() failed");
 
   ParseContext parseContext;
@@ -952,6 +969,7 @@ SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(StaticRegulator re
 
 SqliteDatabase::IngestResult SqliteDatabase::ingestSql(
     StaticRegulator regulator, kj::StringPtr sqlCode) {
+  throwIfUnavailable();
   uint64_t rowsRead = 0;
   uint64_t rowsWritten = 0;
   uint64_t statementCount = 0;
@@ -982,6 +1000,7 @@ SqliteDatabase::IngestResult SqliteDatabase::ingestSql(
 
 void SqliteDatabase::executeWithRegulator(
     StaticRegulator regulator, kj::FunctionParam<void()> func) {
+  throwIfUnavailable();
   // currentRegulator would only be set if we're running this method while running something else
   // with a regulator.  I'm not sure what the ramifications are, so for now, we'll just assume that
   // we can only call executeWithRegulator when no regulator is currently set.
@@ -995,6 +1014,10 @@ void SqliteDatabase::executeWithRegulator(
 }
 
 void SqliteDatabase::reset() {
+  KJ_REQUIRE(!closing, "database connection is already being closed");
+  throwIfClosed();
+  closing = true;
+  KJ_DEFER(closing = false);
   KJ_REQUIRE(!readOnly, "can't reset() read-only database");
 
   // If transactions are open during reset(), whatever had the transaction open is going to get
@@ -1008,24 +1031,152 @@ void SqliteDatabase::reset() {
   KJ_DEFER(onWriteCallback = kj::mv(writeCb));
 
   KJ_IF_SOME(db, maybeDb) {
-    for (auto& listener: resetListeners) {
-      listener.beforeSqliteReset();
-    }
-
-    auto err = sqlite3_close(&db);
-    KJ_REQUIRE(err == SQLITE_OK, "can't reset() database because dependent objects still exist",
-        sqlite3_errstr(err));
-
-    maybeDb = kj::none;
+    closeCurrentConnection(db, "can't reset() database because dependent objects still exist"_kj);
+    pendingCloseError = kj::none;
     vfs.directory.remove(path);
   }
 
-  KJ_ON_SCOPE_FAILURE(maybeDb = kj::none);
+  resetFailure = kj::none;
+  KJ_ON_SCOPE_FAILURE({
+    if (maybeDb != kj::none) {
+      auto& db = KJ_ASSERT_NONNULL(maybeDb);
+      rememberCloseError(rollbackForClose(db));
+      auto closeError = kj::runCatchingExceptions([&]() {
+        closeCurrentConnection(db, "can't close database after reset initialization failed"_kj);
+      });
+      if (closeError == kj::none &&
+          (inTransaction || !savepoints.empty() || !rollbackCallbacks.empty())) {
+        pendingCloseError = finishRollback(kj::mv(pendingCloseError));
+      }
+      if (pendingCloseError != kj::none) {
+        KJ_LOG(ERROR, "failed to roll back database after reset initialization failed",
+            KJ_ASSERT_NONNULL(pendingCloseError));
+      }
+      if (closeError != kj::none) {
+        KJ_LOG(ERROR, "failed to close database after reset initialization failed",
+            KJ_ASSERT_NONNULL(closeError));
+      } else {
+        pendingCloseError = kj::none;
+      }
+    }
+    resetFailure = KJ_EXCEPTION(FAILED, "previous reset() failed");
+  });
   init(kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
 
   KJ_IF_SOME(resetCb, afterResetCallback) {
     resetCb(*this);
   }
+  resetFailure = kj::none;
+  pendingCloseError = kj::none;
+}
+
+void SqliteDatabase::close(kj::Exception reason) {
+  KJ_REQUIRE(!closing, "database connection is already being closed");
+  throwIfClosed();
+  closing = true;
+  KJ_DEFER(closing = false);
+  auto previousResetFailure = kj::mv(resetFailure);
+  resetFailure = kj::none;
+  KJ_ON_SCOPE_FAILURE({
+    if (closedReason == kj::none) {
+      resetFailure = kj::mv(previousResetFailure);
+    }
+  });
+
+  kj::Maybe<kj::Exception> rollbackError;
+  KJ_IF_SOME(db, maybeDb) {
+    rememberCloseError(rollbackForClose(db));
+
+    auto memoryScope = enterMemoryScope();
+    int previousNoCheckpointOnClose;
+    SQLITE_CALL_NODB(
+        sqlite3_db_config(&db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, -1, &previousNoCheckpointOnClose));
+    SQLITE_CALL_NODB(sqlite3_db_config(&db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, nullptr));
+    KJ_ON_SCOPE_FAILURE({
+      auto err = sqlite3_db_config(
+          &db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, previousNoCheckpointOnClose, nullptr);
+      if (err != SQLITE_OK) {
+        KJ_LOG(ERROR, "failed to restore SQLite checkpoint-on-close setting", sqlite3_errstr(err));
+      }
+    });
+
+    closeCurrentConnection(db, "can't close database because dependent objects still exist"_kj);
+  }
+  closedReason = kj::mv(reason);
+  resetFailure = kj::none;
+  if (inTransaction || !savepoints.empty() || !rollbackCallbacks.empty()) {
+    pendingCloseError = finishRollback(kj::mv(pendingCloseError));
+  }
+  rollbackError = kj::mv(pendingCloseError);
+
+  KJ_IF_SOME(error, rollbackError) {
+    kj::throwFatalException(kj::mv(error));
+  }
+}
+
+void SqliteDatabase::closeCurrentConnection(sqlite3& db, kj::StringPtr errorMessage) {
+  auto memoryScope = enterMemoryScope();
+
+  for (auto& listener: resetListeners) {
+    listener.beforeSqliteReset();
+  }
+
+  auto err = sqlite3_close(&db);
+  KJ_REQUIRE(err == SQLITE_OK, errorMessage, sqlite3_errstr(err));
+  maybeDb = kj::none;
+}
+
+kj::Maybe<kj::Exception> SqliteDatabase::rollbackForClose(sqlite3& handle) {
+  if (!inTransaction && savepoints.empty() && rollbackCallbacks.empty()) {
+    return kj::none;
+  }
+
+  kj::Maybe<kj::Exception> firstError;
+  if (sqlite3_get_autocommit(&handle) == 0) {
+    StaticRegulator regulator(TRUSTED);
+    firstError = kj::runCatchingExceptions([&]() {
+      KJ_REQUIRE(currentRegulator == kj::none);
+      currentRegulator = regulator;
+      KJ_DEFER(currentRegulator = kj::none);
+      auto memoryScope = enterMemoryScope();
+      sqlite3* db = &handle;
+      SQLITE_CALL(sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr));
+    });
+  }
+
+  if (sqlite3_get_autocommit(&handle) == 0) {
+    KJ_ASSERT(firstError != kj::none, "ROLLBACK left SQLite transaction open without an error");
+    return firstError;
+  }
+
+  if (inTransaction || !savepoints.empty() || !rollbackCallbacks.empty()) {
+    firstError = finishRollback(kj::mv(firstError));
+  }
+  return firstError;
+}
+
+void SqliteDatabase::rememberCloseError(kj::Maybe<kj::Exception> error) {
+  KJ_IF_SOME(e, error) {
+    if (pendingCloseError == kj::none) {
+      pendingCloseError = kj::mv(e);
+    }
+  }
+}
+
+kj::Maybe<kj::Exception> SqliteDatabase::finishRollback(kj::Maybe<kj::Exception> firstError) {
+  savepoints.clear();
+  inTransaction = false;
+
+  while (!rollbackCallbacks.empty()) {
+    auto callback = kj::mv(rollbackCallbacks.back());
+    rollbackCallbacks.removeLast();
+    KJ_IF_SOME(error, kj::runCatchingExceptions([&]() { callback(); })) {
+      if (firstError == kj::none) {
+        firstError = kj::mv(error);
+      }
+    }
+  }
+  return firstError;
 }
 
 bool SqliteDatabase::isAuthorized(int actionCode,
@@ -1448,6 +1599,7 @@ SqliteDatabase::Statement SqliteDatabase::prepare(
 }
 
 SqliteDatabase::StatementAndEffect& SqliteDatabase::Statement::prepareForExecution() {
+  db.throwIfUnavailable();
   for (auto& stmt: prelude) {
     stmt.run();
   }
@@ -1767,6 +1919,7 @@ bool SqliteDatabase::Query::isNull(uint column) {
 }
 
 SqliteDatabase::StatementAndEffect& SqliteDatabase::Query::getStatementAndEffect() {
+  db.throwIfUnavailable();
   return KJ_UNWRAP_OR(maybeStatement, {
     regulator->onError(kj::none, "SQLite query was canceled because the database was deleted.");
     KJ_FAIL_REQUIRE("query canceled because reset() was called on the database");
