@@ -1,0 +1,11 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "storage-handoff-test",
+    size = "medium",
+    srcs = ["storage-handoff-test.py"],
+    args = ["$(location //src/workerd/server:workerd)"],
+    data = ["//src/workerd/server:workerd"],
+    tags = ["exclusive"],
+    target_compatible_with = ["@platforms//os:linux"],
+)
