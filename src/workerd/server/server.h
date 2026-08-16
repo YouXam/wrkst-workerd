@@ -143,6 +143,17 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   bool hasDynamicWorkerStateForTest(kj::StringPtr name) {
     return services.find(name) != kj::none || actorConfigs.find(name) != kj::none;
   }
+
+  void deleteAllActorsForTest() {
+    deleteAllActors(kj::none);
+  }
+
+  void allowInMemoryActorStorageForTest() {
+    allowInMemoryActorStorage = true;
+  }
+
+  size_t getActorContainerCountForTest(kj::StringPtr namespaceKey);
+
  private:
   kj::Filesystem& fs;
   kj::Timer& timer;
@@ -160,6 +171,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
     .loadSnapshotFromDisk = kj::none};
 
   bool experimental = false;
+  bool allowInMemoryActorStorage = false;
 
   // When set, overrides compatibilityDate for all workers and enforces that workers don't
   // specify their own compatibilityDate.
