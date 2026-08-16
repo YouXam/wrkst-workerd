@@ -2,7 +2,7 @@
   "name": "@wrkst/workerd",
   "version": "0.0.0",
   "description": "workerd runtime for wrkst",
-  "repository": "https://github.com/YouXam/workerd",
+  "repository": "https://github.com/YouXam/wrkst-workerd",
   "license": "Apache-2.0",
   "scripts": {
     "postinstall": "node install.js"
