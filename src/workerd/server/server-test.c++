@@ -24,6 +24,9 @@
 #endif
 
 namespace workerd::server {
+
+WD_STRONG_BOOL(AllowInMemoryActorStorageForTest);
+
 namespace {
 
 #define KJ_FAIL_EXPECT_AT(location, ...) KJ_LOG_AT(ERROR, location, ##__VA_ARGS__);
@@ -325,7 +328,9 @@ class TestServer final: private kj::Filesystem, private kj::EntropySource, priva
  public:
   TestServer(kj::StringPtr configText,
       Worker::ConsoleMode consoleMode = Worker::ConsoleMode::INSPECTOR_ONLY,
-      kj::SourceLocation loc = {})
+      kj::SourceLocation loc = {},
+      AllowInMemoryActorStorageForTest allowInMemoryActorStorage =
+          AllowInMemoryActorStorageForTest::YES)
       : ws(loop),
         config(parseConfig(configText, loc)),
         root(kj::newInMemoryDirectory(*this)),
@@ -346,7 +351,11 @@ class TestServer final: private kj::Filesystem, private kj::EntropySource, priva
               }
             }),
         fakeDate(kj::UNIX_EPOCH),
-        mockNetwork(*this, {}, {}) {}
+        mockNetwork(*this, {}, {}) {
+    if (allowInMemoryActorStorage) {
+      server.allowInMemoryActorStorageForTest();
+    }
+  }
 
   ~TestServer() noexcept(false) {
     for (auto& subq: subrequests) {
@@ -3525,7 +3534,7 @@ KJ_TEST("Server: Durable Objects (on disk)") {
     // files, it leaves it up to the VFS to decide how shared memory works, and our KJ-wrapping
     // VFS currently doesn't put this in SHM files. If we were using a real disk directory,
     // though, they would be there.
-    KJ_EXPECT(dir->openSubdir(kj::Path({"mykey"}))->listNames().size() == 6);
+    KJ_EXPECT(dir->openSubdir(kj::Path({"mykey"}))->listNames().size() == 7);
     KJ_EXPECT(dir->exists(kj::Path(
         {"mykey", "02b496f65dd35cbac90e3e72dc5a398ee93926ea4a3821e26677082d2e6f9b79.sqlite"})));
     KJ_EXPECT(dir->exists(kj::Path(
@@ -3536,14 +3545,16 @@ KJ_TEST("Server: Durable Objects (on disk)") {
         {"mykey", "59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234.sqlite-wal"})));
     KJ_EXPECT(dir->exists(kj::Path({"mykey", "metadata.sqlite"})));
     KJ_EXPECT(dir->exists(kj::Path({"mykey", "metadata.sqlite-wal"})));
+    KJ_EXPECT(dir->exists(kj::Path({"mykey", ".workerd-lease"})));
   }
 
   // Having torn everything down, the WAL files should be gone.
-  KJ_EXPECT(dir->openSubdir(kj::Path({"mykey"}))->listNames().size() == 3);
+  KJ_EXPECT(dir->openSubdir(kj::Path({"mykey"}))->listNames().size() == 4);
   KJ_EXPECT(dir->exists(kj::Path(
       {"mykey", "02b496f65dd35cbac90e3e72dc5a398ee93926ea4a3821e26677082d2e6f9b79.sqlite"})));
   KJ_EXPECT(dir->exists(kj::Path(
       {"mykey", "59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234.sqlite"})));
+  KJ_EXPECT(dir->exists(kj::Path({"mykey", ".workerd-lease"})));
 
   // Let's start a new server and verify it can load the files from disk.
   {
@@ -5126,6 +5137,222 @@ KJ_TEST("Server: fatal task failure bypasses waitUntil drain") {
     KJ_EXPECT(exception != kj::none);
   } else {
     KJ_FAIL_EXPECT("fatal listener failure did not stop the server");
+  }
+}
+
+KJ_TEST("Server: local storage requires a lockable lease file") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `export default { fetch() { return new Response("ok"); } };
+                `export class Actor extends DurableObject {}
+          )],
+          durableObjectNamespaces = [(className = "Actor", uniqueKey = "lease-test")],
+          durableObjectStorage = (localDisk = "disk"),
+        )
+      ),
+      (name = "disk", disk = (path = "../../do-storage", writable = true)),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj,
+      Worker::ConsoleMode::INSPECTOR_ONLY, {}, AllowInMemoryActorStorageForTest::NO);
+
+  test.root->openSubdir(kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE);
+  auto task = test.server.run(v8System, *test.config);
+  KJ_EXPECT_THROW_MESSAGE("requires an OS-backed file handle", task.wait(test.ws));
+}
+
+KJ_TEST("Server: local storage revoke preserves live actor waitUntil work") {
+  auto config = R"((
+    services = [
+      (name = "gate", external = "lease-gate"),
+      (name = "report", external = "lease-report"),
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          compatibilityFlags = ["experimental"],
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `let constructors = 0;
+                `export default {
+                `  async fetch(request, env, ctx) {
+                `    const live = env.NS.get(env.NS.idFromName("live"));
+                `    if (new URL(request.url).pathname === "/verify") {
+                `      return live.fetch("http://actor/verify");
+                `    }
+                `    await live.fetch("http://actor/prime");
+                `    ctx.waitUntil((async () => {
+                `      await env.GATE.fetch("http://lease-gate/");
+                `      const generation = await live.fetch("http://actor/memory")
+                `          .then(response => response.text());
+                `      const storageBlocked = await live.fetch("http://actor/storage")
+                `          .then(response => response.text());
+                `      const directBlocked = await live.fetch("http://actor/direct")
+                `          .then(response => response.text());
+                `      let coldBlocked = true;
+                `      for (let i = 0; i < 16; ++i) {
+                `        try {
+                `          const cold = env.NS.get(env.NS.idFromName(`cold-${i}`));
+                `          await cold.fetch("http://actor/memory");
+                `          coldBlocked = false;
+                `        } catch (error) {
+                `          coldBlocked &&=
+                `              error.message.includes("storage is no longer accessible");
+                `        }
+                `      }
+                `      await env.REPORT.fetch(
+                `          `http://lease-report/${generation}/${storageBlocked}/${directBlocked}/${coldBlocked}`);
+                `    })());
+                `    return new Response("started");
+                `  }
+                `}
+                `export class Actor extends DurableObject {
+                `  constructor(ctx, env) {
+                `    super(ctx, env);
+                `    this.ctx = ctx;
+                `    this.generation = ++constructors;
+                `  }
+                `  async fetch(request) {
+                `    const url = new URL(request.url);
+                `    switch (url.pathname) {
+                `      case "/prime": {
+                `        await this.ctx.storage.put("value", 1);
+                `        for (const name of ["child", "source", "destination"]) {
+                `          const facet = this.ctx.facets.get(
+                `              name, () => ({class: this.ctx.exports.Actor}));
+                `          await facet.fetch(`http://actor/set?value=${name}`);
+                `        }
+                `        return new Response("primed");
+                `      }
+                `      case "/set":
+                `        await this.ctx.storage.put("value", url.searchParams.get("value"));
+                `        return new Response("set");
+                `      case "/value":
+                `        return new Response((await this.ctx.storage.get("value")) ?? "missing");
+                `      case "/verify": {
+                `        const values = await Promise.all(
+                `            ["child", "source", "destination"].map(async name => {
+                `          const facet = this.ctx.facets.get(
+                `              name, () => ({class: this.ctx.exports.Actor}));
+                `          return facet.fetch("http://actor/value").then(response => response.text());
+                `        }));
+                `        return new Response(values.join(","));
+                `      }
+                `      case "/memory":
+                `        return new Response(String(this.generation));
+                `      case "/storage": {
+                `        try {
+                `          await this.ctx.storage.put("value", 2);
+                `          return new Response("false");
+                `        } catch (error) {
+                `          return new Response(String(
+                `              error.message.includes("storage is no longer accessible")));
+                `        }
+                `      }
+                `      case "/direct": {
+                `        let deleteBlocked = false;
+                `        let cloneBlocked = false;
+                `        try {
+                `          this.ctx.facets.delete("child");
+                `        } catch (error) {
+                `          deleteBlocked = error.message.includes("storage is no longer accessible");
+                `        }
+                `        try {
+                `          this.ctx.facets.clone("source", "destination");
+                `        } catch (error) {
+                `          cloneBlocked = error.message.includes("storage is no longer accessible");
+                `        }
+                `        let coldFacetsBlocked = true;
+                `        for (let i = 0; i < 16; ++i) {
+                `          try {
+                `            const cold = this.ctx.facets.get(
+                `                `cold-${i}`, () => ({class: this.ctx.exports.Actor}));
+                `            await cold.fetch("http://actor/memory");
+                `            coldFacetsBlocked = false;
+                `          } catch (error) {
+                `            coldFacetsBlocked &&=
+                `                error.message.includes("storage is no longer accessible");
+                `          }
+                `        }
+                `        return new Response(String(
+                `            deleteBlocked && cloneBlocked && coldFacetsBlocked));
+                `      }
+                `      default:
+                `        return new Response("not found", {status: 404});
+                `    }
+                `  }
+                `}
+          )],
+          bindings = [
+            (name = "GATE", service = "gate"),
+            (name = "REPORT", service = "report"),
+            (name = "NS", durableObjectNamespace = "Actor"),
+          ],
+          durableObjectNamespaces = [(className = "Actor", uniqueKey = "lease-test")],
+          durableObjectStorage = (localDisk = "disk"),
+        )
+      ),
+      (name = "disk", disk = (path = "../../do-storage", writable = true)),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj;
+
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  {
+    TestServer test(config);
+    test.root->transfer(
+        kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE, *dir, nullptr, kj::TransferMode::LINK);
+    test.server.allowExperimental();
+    auto drain = kj::newPromiseAndFulfiller<void>();
+    test.start(kj::mv(drain.promise));
+
+    auto conn = test.connect("test-addr");
+    conn.httpGet200("/", "started");
+    auto gate = test.receiveSubrequest("lease-gate");
+
+    drain.fulfiller->fulfill();
+    KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+    KJ_EXPECT_THROW_MESSAGE(
+        "storage is no longer accessible", test.server.deleteAllActorsForTest());
+    test.wait(11);
+
+    gate.send(R"(
+      HTTP/1.1 200 OK
+      Content-Length: 0
+
+    )"_blockquote);
+
+    auto report = test.receiveSubrequest("lease-report");
+    report.recv(R"(
+      GET /1/true/true/true HTTP/1.1
+      Host: lease-report
+
+    )"_blockquote);
+    report.send(R"(
+      HTTP/1.1 200 OK
+      Content-Length: 0
+
+    )"_blockquote);
+    KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+    KJ_EXPECT(test.server.getActorContainerCountForTest("lease-test") == 4);
+  }
+
+  {
+    TestServer test(config);
+    test.root->transfer(
+        kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE, *dir, nullptr, kj::TransferMode::LINK);
+    test.server.allowExperimental();
+    test.start();
+    auto conn = test.connect("test-addr");
+    conn.httpGet200("/verify", "child,source,destination");
   }
 }
 
@@ -6907,11 +7134,11 @@ KJ_TEST("Server: Durable Object facets") {
       kj::Path({"3652ef6221834806dc8df802d1d216e27b7d07e0a6b7adf6cfdaeec90f06459a.5.sqlite"})));
 
   // We didn't create any other durable objects in the namespace. All files in the namespace should
-  // be prefixed with our one DO ID, except for metadata.sqlite (the per-namespace alarm scheduler).
+  // be prefixed with our one DO ID, apart from the per-namespace metadata and lease files.
   for (auto& name: nsDir->listNames()) {
     KJ_EXPECT(
         name.startsWith("3652ef6221834806dc8df802d1d216e27b7d07e0a6b7adf6cfdaeec90f06459a.") ||
-            name.startsWith("metadata.sqlite"),
+            name.startsWith("metadata.sqlite") || name == ".workerd-lease",
         "unexpected file found in namespace storage", name);
   }
 

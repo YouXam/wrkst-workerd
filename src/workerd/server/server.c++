@@ -58,10 +58,24 @@
 #include <kj/glob-filter.h>
 #include <kj/map.h>
 
+#include <cerrno>
 #include <cstdlib>
 #include <ctime>
 
+#if _WIN32
+#include <windows.h>
+
+#include <kj/win32-api-version.h>
+#include <kj/windows-sanity.h>
+
+#undef DELETE  // Conflicts with kj::HttpMethod::DELETE.
+#else
+#include <sys/file.h>
+#endif
+
 namespace workerd::server {
+
+WD_STRONG_BOOL(AllowInMemoryActorStorage);
 
 // Escape a string value for embedding in a JSON string literal. Returns the escaped text
 // wrapped in double quotes, e.g. `"hello \"world\""`.
@@ -369,8 +383,10 @@ class Server::ActorNamespace final {
       kj::Network& dockerNetwork,
       kj::Maybe<kj::StringPtr> dockerPath,
       kj::Maybe<kj::StringPtr> containerEgressInterceptorImage,
+      kj::TaskSet& lifecycleTasks,
       kj::TaskSet& waitUntilTasks,
-      Persistent selfTokensArePersistent)
+      Persistent selfTokensArePersistent,
+      AllowInMemoryActorStorage allowInMemoryActorStorage)
       : actorClass(kj::mv(actorClass)),
         config(config),
         clock(clock),
@@ -380,44 +396,36 @@ class Server::ActorNamespace final {
         dockerNetwork(dockerNetwork),
         dockerPath(dockerPath),
         containerEgressInterceptorImage(containerEgressInterceptorImage),
+        lifecycleTasks(lifecycleTasks),
         waitUntilTasks(waitUntilTasks),
-        selfTokensArePersistent(selfTokensArePersistent) {}
+        selfTokensArePersistent(selfTokensArePersistent),
+        allowInMemoryActorStorage(allowInMemoryActorStorage) {}
 
   void link(kj::Maybe<const kj::Directory&> serviceActorStorage) {
-    KJ_IF_SOME(dir, serviceActorStorage) {
-      KJ_IF_SOME(d, config.tryGet<Durable>()) {
-        this->actorStorage.emplace(
-            dir.openSubdir(kj::Path({d.uniqueKey}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY));
-      }
-    }
-
     KJ_IF_SOME(d, config.tryGet<Durable>()) {
-      auto idFactory = kj::heap<ActorIdFactoryImpl>(d.uniqueKey);
-      AlarmScheduler::GetActorFn getActor =
-          [this, idFactory = kj::mv(idFactory)](
-              const ActorKey& actor) mutable -> kj::Own<WorkerInterface> {
-        Worker::Actor::Id id = idFactory->idFromStringNamed(
-            kj::str(actor.actorId), actor.name.map([](kj::StringPtr n) { return kj::str(n); }));
-        auto actorContainer = this->getActorContainer(kj::mv(id));
-        return newPromisedWorkerInterface(
-            actorContainer->startRequest({}).attach(actorContainer->addRef()));
-      };
-
-      KJ_IF_SOME(as, this->actorStorage) {
-        // Create per-namespace alarm scheduler backed by on-disk storage in the
-        // namespace directory, alongside the per-actor .sqlite files.
-        this->ownAlarmScheduler = kj::heap<AlarmScheduler>(
-            clock, timer, as.vfs, kj::Path({"metadata.sqlite"}), kj::mv(getActor));
+      KJ_IF_SOME(dir, serviceActorStorage) {
+        pendingActorStorage =
+            dir.openSubdir(kj::Path({d.uniqueKey}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+        leaseFile = KJ_ASSERT_NONNULL(pendingActorStorage)
+                        ->openFile(kj::Path({".workerd-lease"}),
+                            kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+        storageState = StorageState::WAITING;
+        if (tryAcquireLease()) {
+          initializeLocalStorage();
+          storageState = StorageState::ACTIVE;
+        } else {
+          auto task = leaseTaskCanceler.wrap(acquireLease()).fork();
+          lifecycleTasks.add(task.addBranch().catch_([this](kj::Exception&& exception) {
+            if (storageState == StorageState::REVOKING || storageState == StorageState::REVOKED) {
+              return kj::Promise<void>(kj::READY_NOW);
+            }
+            return kj::Promise<void>(kj::mv(exception));
+          }));
+          leaseTask = kj::mv(task);
+        }
       } else {
-        // No on-disk storage -- create an in-memory alarm scheduler.
-        auto memDir = kj::newInMemoryDirectory(clock);
-        auto vfs = kj::heap<SqliteDatabase::Vfs>(*memDir);
-        this->ownAlarmScheduler = kj::heap<AlarmScheduler>(
-            clock, timer, *vfs, kj::Path({"metadata.sqlite"}), kj::mv(getActor))
-                                      .attach(kj::mv(vfs), kj::mv(memDir));
+        initializeInMemoryAlarmScheduler();
       }
-
-      this->alarmScheduler = *KJ_ASSERT_NONNULL(ownAlarmScheduler);
     }
   }
 
@@ -439,20 +447,7 @@ class Server::ActorNamespace final {
   }
 
   kj::Own<IoChannelFactory::ActorChannel> getActorChannel(
-      Worker::Actor::Id id, Persistent persistent = Persistent::NO) {
-    KJ_IF_SOME(doId, id.tryGet<kj::Own<ActorIdFactory::ActorId>>()) {
-      KJ_IF_SOME(name, doId->getName()) {
-        // To emulate production, we preserve the name on the id, but only if it's <= 1024 bytes.
-        if (name.size() > 1024) {
-          auto* idImpl = dynamic_cast<ActorIdFactoryImpl::ActorIdImpl*>(doId.get());
-          KJ_ASSERT(idImpl != nullptr, "Unexpected ActorId type?");
-          idImpl->clearName();
-        }
-      }
-    }
-
-    return kj::refcounted<ActorChannelImpl>(getActorContainer(kj::mv(id)), persistent);
-  }
+      Worker::Actor::Id id, Persistent persistent = Persistent::NO);
 
   class ActorContainer;
   using ActorMap = kj::HashMap<kj::StringPtr, kj::Own<ActorContainer>>;
@@ -549,7 +544,7 @@ class Server::ActorNamespace final {
       }
       inactiveFulfillers.clear();
 
-      if (ns.isEvictable()) {
+      if (ns.canEvictActors() && ns.isEvictable()) {
         KJ_IF_SOME(a, actor) {
           KJ_IF_SOME(m, a->getHibernationManager()) {
             // The hibernation manager needs to survive actor eviction and be passed to the actor
@@ -595,11 +590,39 @@ class Server::ActorNamespace final {
       return kj::addRef(*this);
     }
 
+    size_t getActorContainerCountForTest() {
+      size_t result = 1;
+      for (auto& facet: facets) {
+        result += facet.value->getActorContainerCountForTest();
+      }
+      return result;
+    }
+
+    void beginStorageRevoke(kj::Exception reason, kj::Vector<kj::Promise<void>>& promises) {
+      shutdownTask = kj::none;
+      for (auto& facet: facets) {
+        facet.value->beginStorageRevoke(reason.clone(), promises);
+      }
+      KJ_IF_SOME(a, actor) {
+        auto actorRef = a->addRef();
+        KJ_IF_SOME(cache, a->getPersistent()) {
+          KJ_IF_SOME(task, cache.revokeStorage(kj::mv(reason))) {
+            promises.add(kj::mv(task).attach(kj::mv(actorRef)));
+          }
+        }
+      }
+    }
+
     // Get the actor, starting it if it's not already running.
     kj::Promise<kj::Own<Worker::Actor>> getActor() {
       requireNotBroken();
 
       if (actor == kj::none) {
+        KJ_IF_SOME(waitForStorage, ns.waitForStorage()) {
+          co_await waitForStorage;
+          requireNotBroken();
+        }
+
         KJ_IF_SOME(promise, classAndId.tryGet<kj::ForkedPromise<void>>()) {
           co_await promise;
           requireNotBroken();
@@ -614,6 +637,7 @@ class Server::ActorNamespace final {
 
         // A concurrent request could have started the actor, so check again.
         if (actor == kj::none) {
+          ns.requireStorageActive();
           start(actorClass, id);
         }
       }
@@ -631,7 +655,7 @@ class Server::ActorNamespace final {
         IoChannelFactory::SubrequestMetadata metadata) {
       auto actor = co_await getActor();
 
-      if (ns.cleanupTask == kj::none) {
+      if (ns.canEvictActors() && ns.cleanupTask == kj::none) {
         // Need to start the cleanup loop.
         ns.cleanupTask = ns.cleanupLoop();
       }
@@ -715,6 +739,11 @@ class Server::ActorNamespace final {
 
     kj::Own<ActorContainer> getFacetContainer(
         kj::String childKey, kj::Function<kj::Promise<StartInfo>()> getStartInfo) {
+      KJ_IF_SOME(existing, facets.find(childKey)) {
+        return existing->addRef();
+      }
+      ns.requireStorageActive();
+
       auto makeContainer = [&]() {
         auto promise = callFacetStartCallback(kj::mv(getStartInfo));
         return kj::refcounted<ActorContainer>(kj::mv(childKey), ns, *this, kj::mv(promise), timer);
@@ -752,6 +781,7 @@ class Server::ActorNamespace final {
     }
 
     void deleteFacet(kj::StringPtr name) override {
+      ns.requireStorageActive();
       // First, abort any running facets.
       abortFacet(name, JSG_KJ_EXCEPTION(FAILED, Error, "Facet was deleted."));
 
@@ -766,6 +796,7 @@ class Server::ActorNamespace final {
     }
 
     void cloneFacet(kj::StringPtr src, kj::StringPtr dst) override {
+      ns.requireStorageActive();
       // Replacing a facet implies aborting it.
       abortFacet(dst, JSG_KJ_EXCEPTION(FAILED, Error, "Facet was cloned-over."));
 
@@ -872,6 +903,7 @@ class Server::ActorNamespace final {
     // if it hasn't been created yet.
     FacetTreeIndex& ensureFacetTreeIndex() {
       KJ_REQUIRE(parent == kj::none, "only 'root' may ensureFacetTreeIndex()");
+      ns.requireStorageActive();
 
       KJ_IF_SOME(i, facetTreeIndex) {
         return *i;
@@ -889,6 +921,7 @@ class Server::ActorNamespace final {
     // Like ensureFacetTreeIndex() but if the index doesn't exist on disk, return kj::none.
     kj::Maybe<FacetTreeIndex&> getFacetTreeIndexIfNotEmpty() {
       KJ_REQUIRE(parent == kj::none);
+      ns.requireStorageActive();
 
       KJ_IF_SOME(i, facetTreeIndex) {
         return *i;
@@ -1382,16 +1415,11 @@ class Server::ActorNamespace final {
     kj::Array<byte> getChannelTokenImpl(IoChannelFactory::ChannelTokenUsage usage,
         const Worker::Actor::Id& id,
         Persistent persistent) {
-      kj::StringPtr uniqueKey = KJ_ASSERT_NONNULL(ns.getConfig().tryGet<Durable>()).uniqueKey;
-      auto& abstractId = *KJ_ASSERT_NONNULL(id.tryGet<kj::Own<ActorIdFactory::ActorId>>());
-      auto& idImpl =
-          KJ_ASSERT_NONNULL(kj::tryDowncast<const ActorIdFactoryImpl::ActorIdImpl>(abstractId));
-      return ns.channelTokenHandler.encodeActorChannelToken(
-          usage, uniqueKey, idImpl.getRaw(), idImpl.getName(), persistent);
+      return ns.encodeActorChannelToken(usage, id, persistent);
     }
   };
 
-  kj::Own<ActorContainer> getActorContainer(Worker::Actor::Id id) {
+  kj::String getActorKey(const Worker::Actor::Id& id) {
     kj::String key;
 
     KJ_SWITCH_ONEOF(id) {
@@ -1404,6 +1432,12 @@ class Server::ActorNamespace final {
         key = kj::str(str);
       }
     }
+
+    return key;
+  }
+
+  kj::Own<ActorContainer> getActorContainer(Worker::Actor::Id id) {
+    auto key = getActorKey(id);
 
     return actors
         .findOrCreate(key, [&]() mutable {
@@ -1496,6 +1530,7 @@ class Server::ActorNamespace final {
   // Idle/non-running actors are skipped (not an error). The actor map entries are retained so the
   // DO rebuilds on its next request. See IoChannelFactory::evictAllActorsForTest().
   kj::Promise<void> evictAllForTest(IoChannelFactory::EvictWebSocketMode webSocketMode) {
+    requireStorageActive();
     if (!isEvictable()) return kj::READY_NOW;
 
     kj::Vector<kj::Promise<void>> promises(actors.size());
@@ -1512,6 +1547,7 @@ class Server::ActorNamespace final {
   // Resets all actor databases, aborts all actors, and cancels all alarms so DOs
   // can be recreated with clean state.
   void deleteAll(kj::Maybe<const kj::Exception&> reason) {
+    requireStorageActive();
     // Reset databases before aborting so connections are still open (avoids
     // Windows file-locking issues with deferred handle release).
     for (auto& actor: actors) {
@@ -1523,6 +1559,44 @@ class Server::ActorNamespace final {
     KJ_IF_SOME(scheduler, ownAlarmScheduler) {
       scheduler->deleteAll();
     }
+  }
+
+  kj::Maybe<kj::Promise<void>> revokeStorage(kj::Exception reason) {
+    switch (storageState) {
+      case StorageState::IN_MEMORY:
+        return kj::none;
+      case StorageState::WAITING:
+        storageStateReason = reason.clone();
+        storageState = StorageState::REVOKING;
+        leaseTaskCanceler.cancel(reason);
+        leaseFile = kj::none;
+        pendingActorStorage = kj::none;
+        storageState = StorageState::REVOKED;
+        return kj::none;
+      case StorageState::ACTIVE: {
+        storageStateReason = reason.clone();
+        storageState = StorageState::REVOKING;
+        cleanupTask = kj::none;
+        KJ_ASSERT_NONNULL(ownAlarmScheduler)->beginRevoke(reason.clone());
+
+        kj::Vector<kj::Promise<void>> promises;
+        for (auto& actor: actors) {
+          actor.value->beginStorageRevoke(reason.clone(), promises);
+        }
+
+        auto task = finishStorageRevoke(kj::joinPromises(promises.releaseAsArray())).fork();
+        auto result = task.addBranch();
+        storageRevokeTask = kj::mv(task);
+        return result;
+      }
+      case StorageState::REVOKING:
+        return KJ_ASSERT_NONNULL(storageRevokeTask).addBranch();
+      case StorageState::REVOKED:
+        return kj::Promise<void>(kj::READY_NOW);
+      case StorageState::BROKEN:
+        return kj::Promise<void>(KJ_ASSERT_NONNULL(storageStateReason).clone());
+    }
+    KJ_UNREACHABLE;
   }
 
  private:
@@ -1538,6 +1612,16 @@ class Server::ActorNamespace final {
         : directory(kj::mv(directoryParam)),
           vfs(*directory) {}
   };
+
+  enum class StorageState { IN_MEMORY, WAITING, ACTIVE, REVOKING, REVOKED, BROKEN };
+  static constexpr size_t MAX_PENDING_LEASE_EVENTS = 1024;
+  static constexpr auto LEASE_RETRY_START = 1 * kj::MILLISECONDS;
+  static constexpr auto LEASE_RETRY_MAX = 50 * kj::MILLISECONDS;
+
+  StorageState storageState = StorageState::IN_MEMORY;
+  kj::Maybe<kj::Exception> storageStateReason;
+  kj::Maybe<kj::Own<const kj::Directory>> pendingActorStorage;
+  kj::Maybe<kj::Own<const kj::File>> leaseFile;
 
   // Note: The Vfs, actorStorage, and ownAlarmScheduler must not be torn down until all actors
   // have been torn down, so we declare them before `actors`.
@@ -1577,12 +1661,17 @@ class Server::ActorNamespace final {
   ActorMap actors;
 
   kj::Maybe<kj::Promise<void>> cleanupTask;
+  kj::Canceler leaseTaskCanceler;
+  kj::Maybe<kj::ForkedPromise<void>> leaseTask;
+  kj::Maybe<kj::ForkedPromise<void>> storageRevokeTask;
+  size_t pendingLeaseEvents = 0;
   kj::Timer& timer;
   capnp::ByteStreamFactory& byteStreamFactory;
   ChannelTokenHandler& channelTokenHandler;
   kj::Network& dockerNetwork;
   kj::Maybe<kj::StringPtr> dockerPath;
   kj::Maybe<kj::StringPtr> containerEgressInterceptorImage;
+  kj::TaskSet& lifecycleTasks;
   kj::TaskSet& waitUntilTasks;
 
   // Whether the worker owning this actor namespace has `allow_irrevocable_stub_storage` enabled,
@@ -1590,6 +1679,140 @@ class Server::ActorNamespace final {
   Persistent selfTokensArePersistent;
 
   kj::Maybe<AlarmScheduler&> alarmScheduler;
+  AllowInMemoryActorStorage allowInMemoryActorStorage;
+
+  kj::Array<byte> encodeActorChannelToken(IoChannelFactory::ChannelTokenUsage usage,
+      const Worker::Actor::Id& id,
+      Persistent persistent) {
+    kj::StringPtr uniqueKey = config.get<Durable>().uniqueKey;
+    auto& abstractId = *KJ_ASSERT_NONNULL(id.tryGet<kj::Own<ActorIdFactory::ActorId>>());
+    auto& idImpl =
+        KJ_ASSERT_NONNULL(kj::tryDowncast<const ActorIdFactoryImpl::ActorIdImpl>(abstractId));
+    return channelTokenHandler.encodeActorChannelToken(
+        usage, uniqueKey, idImpl.getRaw(), idImpl.getName(), persistent);
+  }
+
+  AlarmScheduler::GetActorFn makeAlarmGetActor() {
+    auto idFactory = kj::heap<ActorIdFactoryImpl>(config.get<Durable>().uniqueKey);
+    return [this, idFactory = kj::mv(idFactory)](
+               const ActorKey& actor) mutable -> kj::Own<WorkerInterface> {
+      Worker::Actor::Id id = idFactory->idFromStringNamed(
+          kj::str(actor.actorId), actor.name.map([](kj::StringPtr name) { return kj::str(name); }));
+      auto actorContainer = getActorContainer(kj::mv(id));
+      return newPromisedWorkerInterface(
+          actorContainer->startRequest({}).attach(actorContainer->addRef()));
+    };
+  }
+
+  void initializeLocalStorage() {
+    auto directory = kj::mv(KJ_ASSERT_NONNULL(pendingActorStorage));
+    auto& storage = actorStorage.emplace(kj::mv(directory));
+    ownAlarmScheduler = kj::heap<AlarmScheduler>(
+        clock, timer, storage.vfs, kj::Path({"metadata.sqlite"}), makeAlarmGetActor());
+    alarmScheduler = *KJ_ASSERT_NONNULL(ownAlarmScheduler);
+  }
+
+  void initializeInMemoryAlarmScheduler() {
+    auto directory = kj::newInMemoryDirectory(clock);
+    auto vfs = kj::heap<SqliteDatabase::Vfs>(*directory);
+    ownAlarmScheduler = kj::heap<AlarmScheduler>(
+        clock, timer, *vfs, kj::Path({"metadata.sqlite"}), makeAlarmGetActor())
+                            .attach(kj::mv(vfs), kj::mv(directory));
+    alarmScheduler = *KJ_ASSERT_NONNULL(ownAlarmScheduler);
+  }
+
+  bool tryAcquireLease() {
+#if _WIN32
+    KJ_IF_SOME(rawHandle, KJ_ASSERT_NONNULL(leaseFile)->getWin32Handle()) {
+      OVERLAPPED offset{};
+      if (LockFileEx(static_cast<HANDLE>(rawHandle),
+              LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &offset)) {
+        return true;
+      }
+      auto error = GetLastError();
+      if (error == ERROR_LOCK_VIOLATION) return false;
+      KJ_FAIL_WIN32("LockFileEx", error);
+    }
+#else
+    KJ_IF_SOME(fd, KJ_ASSERT_NONNULL(leaseFile)->getFd()) {
+      for (;;) {
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0) return true;
+        int error = errno;
+        if (error == EINTR) continue;
+        if (error == EWOULDBLOCK || error == EAGAIN) return false;
+        KJ_FAIL_SYSCALL("flock", error);
+      }
+    }
+#endif
+    KJ_REQUIRE(allowInMemoryActorStorage.toBool(),
+        "local Durable Object storage lease requires an OS-backed file handle");
+    return true;
+  }
+
+  kj::Promise<void> acquireLease() {
+    auto delay = LEASE_RETRY_START;
+    try {
+      for (;;) {
+        co_await timer.afterDelay(delay);
+        if (tryAcquireLease()) break;
+        delay = kj::min(delay * 2, LEASE_RETRY_MAX);
+      }
+      KJ_REQUIRE(storageState == StorageState::WAITING);
+      initializeLocalStorage();
+      storageState = StorageState::ACTIVE;
+    } catch (...) {
+      auto exception = kj::getCaughtExceptionAsKj();
+      storageStateReason = exception.clone();
+      storageState = StorageState::BROKEN;
+      kj::throwFatalException(kj::mv(exception));
+    }
+  }
+
+  kj::Maybe<kj::Promise<void>> waitForStorage() {
+    switch (storageState) {
+      case StorageState::IN_MEMORY:
+      case StorageState::ACTIVE:
+        return kj::none;
+      case StorageState::WAITING:
+        return waitForStorageImpl();
+      case StorageState::REVOKING:
+      case StorageState::REVOKED:
+      case StorageState::BROKEN:
+        kj::throwFatalException(KJ_ASSERT_NONNULL(storageStateReason).clone());
+    }
+    KJ_UNREACHABLE;
+  }
+
+  kj::Promise<void> waitForStorageImpl() {
+    if (pendingLeaseEvents >= MAX_PENDING_LEASE_EVENTS) {
+      kj::throwFatalException(KJ_EXCEPTION(
+          OVERLOADED, "jsg.Error: Durable Object is overloaded. Too many requests queued."));
+    }
+    ++pendingLeaseEvents;
+    KJ_DEFER(--pendingLeaseEvents);
+    co_await KJ_ASSERT_NONNULL(leaseTask).addBranch();
+    requireStorageActive();
+  }
+
+  void requireStorageActive() {
+    if (storageState == StorageState::IN_MEMORY || storageState == StorageState::ACTIVE) return;
+    KJ_IF_SOME(reason, storageStateReason) {
+      kj::throwFatalException(reason.clone());
+    }
+    kj::throwFatalException(KJ_EXCEPTION(FAILED, kj::str(ActorCache::SHUTDOWN_ERROR_MESSAGE)));
+  }
+
+  bool canEvictActors() {
+    return storageState == StorageState::IN_MEMORY || storageState == StorageState::ACTIVE;
+  }
+
+  kj::Promise<void> finishStorageRevoke(kj::Promise<void> actorStorageRevoke) {
+    co_await actorStorageRevoke;
+    auto alarmDrain = KJ_ASSERT_NONNULL(ownAlarmScheduler)->finishRevoke();
+    waitUntilTasks.add(kj::mv(alarmDrain));
+    leaseFile = kj::none;
+    storageState = StorageState::REVOKED;
+  }
 
   // Removes actors from `actors` after 70 seconds of last access.
   kj::Promise<void> cleanupLoop() {
@@ -1662,6 +1885,61 @@ class Server::ActorNamespace final {
     Persistent persistent;
   };
 
+  class DeferredActorChannelImpl final: public IoChannelFactory::ActorChannel {
+   public:
+    DeferredActorChannelImpl(ActorNamespace& ns, Worker::Actor::Id id, Persistent persistent)
+        : ns(ns),
+          id(kj::mv(id)),
+          persistent(persistent) {}
+
+    kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+      metadata.fromPersistentStub = metadata.fromPersistentStub || persistent;
+      return newPromisedWorkerInterface(
+          startRequestAfterLease(ns, Worker::Actor::cloneId(id), kj::mv(metadata)));
+    }
+
+    kj::Promise<void> evictForTest(IoChannelFactory::EvictWebSocketMode webSocketMode) override {
+      return evictAfterLease(ns, Worker::Actor::cloneId(id), webSocketMode);
+    }
+
+    void requireAllowsTransfer() override {
+      JSG_REQUIRE(ns.getConfig().is<Durable>(), DOMDataCloneError,
+          "Stubs pointing to ephemeral objects are not serializable.");
+    }
+
+    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+        IoChannelFactory::ChannelTokenUsage usage) override {
+      requireAllowsTransfer();
+      return ns.encodeActorChannelToken(usage, id, persistent);
+    }
+
+   private:
+    ActorNamespace& ns;
+    Worker::Actor::Id id;
+    Persistent persistent;
+
+    static kj::Promise<kj::Own<WorkerInterface>> startRequestAfterLease(ActorNamespace& ns,
+        Worker::Actor::Id requestId,
+        IoChannelFactory::SubrequestMetadata metadata) {
+      KJ_IF_SOME(wait, ns.waitForStorage()) {
+        co_await wait;
+      }
+      auto actorContainer = ns.getActorContainer(kj::mv(requestId));
+      co_return co_await actorContainer->startRequest(kj::mv(metadata))
+          .attach(actorContainer->addRef());
+    }
+
+    static kj::Promise<void> evictAfterLease(ActorNamespace& ns,
+        Worker::Actor::Id requestId,
+        IoChannelFactory::EvictWebSocketMode webSocketMode) {
+      KJ_IF_SOME(wait, ns.waitForStorage()) {
+        co_await wait;
+      }
+      auto actorContainer = ns.getActorContainer(kj::mv(requestId));
+      co_await actorContainer->evictForTest(webSocketMode).attach(actorContainer->addRef());
+    }
+  };
+
   // `SelfTokenFactory` for a root (non-facet) Durable Object instance. Note that unlike
   // `StaticServiceSelfTokenFactory`, this does not simply hold a reference to the entrypoint,
   // because that would mean holding a reference to the `ActorChannelImpl` or `ActorContainer`,
@@ -1679,13 +1957,7 @@ class Server::ActorNamespace final {
       JSG_REQUIRE(ns.getConfig().is<Durable>(), DOMDataCloneError,
           "Stubs pointing to ephemeral objects are not serializable.");
 
-      kj::StringPtr uniqueKey = ns.getConfig().get<Durable>().uniqueKey;
-      const ActorIdFactory::ActorId& abstractId =
-          *KJ_ASSERT_NONNULL(id.tryGet<kj::Own<ActorIdFactory::ActorId>>());
-      auto& idImpl =
-          KJ_ASSERT_NONNULL(kj::tryDowncast<const ActorIdFactoryImpl::ActorIdImpl>(abstractId));
-      return ns.channelTokenHandler.encodeActorChannelToken(
-          usage, uniqueKey, idImpl.getRaw(), idImpl.getName(), ns.selfTokensArePersistent);
+      return ns.encodeActorChannelToken(usage, id, ns.selfTokensArePersistent);
     }
 
    private:
@@ -1734,6 +2006,38 @@ class Server::ActorNamespace final {
     kj::Own<ActorKey> actor;
   };
 };
+
+kj::Own<IoChannelFactory::ActorChannel> Server::ActorNamespace::getActorChannel(
+    Worker::Actor::Id id, Persistent persistent) {
+  KJ_IF_SOME(doId, id.tryGet<kj::Own<ActorIdFactory::ActorId>>()) {
+    KJ_IF_SOME(name, doId->getName()) {
+      // To emulate production, we preserve the name on the id, but only if it's <= 1024 bytes.
+      if (name.size() > 1024) {
+        auto* idImpl = dynamic_cast<ActorIdFactoryImpl::ActorIdImpl*>(doId.get());
+        KJ_ASSERT(idImpl != nullptr, "Unexpected ActorId type?");
+        idImpl->clearName();
+      }
+    }
+  }
+
+  auto key = getActorKey(id);
+  KJ_IF_SOME(actorContainer, actors.find(key)) {
+    return kj::refcounted<ActorChannelImpl>(actorContainer->addRef(), persistent);
+  }
+
+  if (storageState != StorageState::IN_MEMORY && storageState != StorageState::ACTIVE) {
+    return kj::refcounted<DeferredActorChannelImpl>(*this, kj::mv(id), persistent);
+  }
+  return kj::refcounted<ActorChannelImpl>(getActorContainer(kj::mv(id)), persistent);
+}
+
+size_t Server::getActorContainerCountForTest(kj::StringPtr namespaceKey) {
+  size_t result = 0;
+  for (auto& actor: KJ_ASSERT_NONNULL(actorNamespacesByUniqueKey.find(namespaceKey))->actors) {
+    result += actor.value->getActorContainerCountForTest();
+  }
+  return result;
+}
 
 // =======================================================================================
 
@@ -3465,7 +3769,9 @@ class Server::WorkerService final: public Service,
   // done during the constructor.
   void initActorNamespaces(const kj::HashMap<kj::String, ActorConfig>& actorClasses,
       kj::HashMap<kj::StringPtr, ActorNamespace*>& actorNamespacesByUniqueKey,
-      kj::Network& network) {
+      kj::Network& network,
+      kj::TaskSet& lifecycleTasks,
+      AllowInMemoryActorStorage allowInMemoryActorStorage) {
     actorNamespaces.reserve(actorClasses.size());
     for (auto& entry: actorClasses) {
       if (!actorClassEntrypoints.contains(entry.key)) {
@@ -3482,7 +3788,8 @@ class Server::WorkerService final: public Service,
       auto ns = kj::heap<ActorNamespace>(kj::mv(actorClass), entry.value,
           kj::systemPreciseCalendarClock(), threadContext.getUnsafeTimer(),
           threadContext.getByteStreamFactory(), channelTokenHandler, network, dockerPath,
-          containerEgressInterceptorImage, waitUntilTasks, selfTokensArePersistent());
+          containerEgressInterceptorImage, lifecycleTasks, waitUntilTasks,
+          selfTokensArePersistent(), allowInMemoryActorStorage);
       KJ_IF_SOME(d, entry.value.tryGet<Durable>()) {
         actorNamespacesByUniqueKey.insert(d.uniqueKey, ns.get());
       }
@@ -3650,6 +3957,17 @@ class Server::WorkerService final: public Service,
 
   kj::Promise<void> onWaitUntilTasksEmpty() {
     return waitUntilTasks.onEmpty().attach(kj::addRef(*this));
+  }
+
+  kj::Maybe<kj::Promise<void>> revokeLocalActorStorage(kj::Exception reason) {
+    kj::Vector<kj::Promise<void>> promises;
+    for (auto& namespaceEntry: actorNamespaces) {
+      KJ_IF_SOME(task, namespaceEntry.value->revokeStorage(reason.clone())) {
+        promises.add(kj::mv(task));
+      }
+    }
+    if (promises.empty()) return kj::none;
+    return kj::joinPromises(promises.releaseAsArray()).attach(kj::addRef(*this));
   }
 
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
@@ -6476,7 +6794,8 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       KJ_BIND_METHOD(*this, abortAllActors), KJ_BIND_METHOD(*this, deleteAllActors),
       kj::mv(dockerPath), kj::mv(containerEgressInterceptorImage), def.isDynamic,
       kj::mv(abortIsolateCallback), kj::mv(accessBlobHeaderName));
-  result->initActorNamespaces(def.localActorConfigs, actorNamespacesByUniqueKey, network);
+  result->initActorNamespaces(def.localActorConfigs, actorNamespacesByUniqueKey, network, tasks,
+      AllowInMemoryActorStorage(allowInMemoryActorStorage));
   co_return result;
 }
 
@@ -7261,6 +7580,13 @@ kj::Promise<void> Server::handleDrain(kj::Promise<void> drainWhen) {
     // dropping it won't actually cancel anything. But since that's not documented in drain()'s
     // doc comment, we instead add the promise to `tasks` to be safe.
     tasks.add(httpServer.httpServer.drain());
+  }
+
+  auto reason = KJ_EXCEPTION(FAILED, kj::str(ActorCache::SHUTDOWN_ERROR_MESSAGE));
+  for (auto& listed: workerServices) {
+    KJ_IF_SOME(task, listed.workerService.revokeLocalActorStorage(reason.clone())) {
+      tasks.add(kj::mv(task));
+    }
   }
 }
 
