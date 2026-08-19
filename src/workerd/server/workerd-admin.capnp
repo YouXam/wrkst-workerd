@@ -18,10 +18,24 @@ struct AddWorkerResult {
   }
 }
 
+struct RemoveWorkerResult {
+  union {
+    removed @0 :Void;
+    notFound @1 :Void;
+    restartRequired @2 :Text;
+    error @3 :Text;
+  }
+}
+
 interface WorkerdAdmin {
   # Privileged process control interface served over the connected Unix stream passed by --admin-fd.
 
   stats @0 () -> (workerServiceCount :UInt32);
   addWorker @1 (serviceName :Text, digest :Data, worker :Workerd.Worker)
       -> (result :AddWorkerResult);
+  removeWorker @2 (serviceName :Text) -> (result :RemoveWorkerResult);
+  # Removes a Worker previously loaded through addWorker(). Returns `removed` once the Worker is
+  # unrouted: new invocations fail and the serviceName is immediately free for a fresh addWorker().
+  # In-flight requests and waitUntil tasks drain in the background, after which the isolate is
+  # destroyed. Statically-configured services answer `restartRequired`.
 }
