@@ -620,6 +620,11 @@ struct AdminAddResult {
   kj::String message;
 };
 
+struct AdminRemoveResult {
+  admin::RemoveWorkerResult::Which status;
+  kj::String message;
+};
+
 class TestAdminClient {
  public:
   TestAdminClient(TestServer& test): TestAdminClient(test, kj::newTwoWayPipe()) {}
@@ -636,6 +641,22 @@ class TestAdminClient {
     request.setDigest(digest);
     buildWorker(request.initWorker());
     return decode(request.send().wait(ws).getResult());
+  }
+
+  AdminRemoveResult removeWorker(kj::StringPtr serviceName) {
+    auto request = client.removeWorkerRequest();
+    request.setServiceName(serviceName);
+    auto result = request.send().wait(ws).getResult();
+    switch (result.which()) {
+      case admin::RemoveWorkerResult::REMOVED:
+      case admin::RemoveWorkerResult::NOT_FOUND:
+        return {result.which(), kj::str("")};
+      case admin::RemoveWorkerResult::RESTART_REQUIRED:
+        return {result.which(), kj::str(result.getRestartRequired())};
+      case admin::RemoveWorkerResult::ERROR:
+        return {result.which(), kj::str(result.getError())};
+    }
+    KJ_UNREACHABLE;
   }
 
   admin::WorkerdAdmin::Client& getClient() {
@@ -5098,6 +5119,222 @@ KJ_TEST("Server: drain closes admin and waits for published dynamic workers") {
 
   )"_blockquote);
   KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: admin RPC removes dynamic workers and frees their name") {
+  TestServer test(R"((
+    services = [
+      ( name = "backend",
+        worker = (
+          compatibilityDate = "2024-10-01",
+          modules = [
+            ( name = "worker.js",
+              esModule = `export default { fetch() { return new Response("static"); } }
+            )
+          ]
+        )
+      ),
+      (name = "ingress", workerRouter = (header = "X-Worker-Route", servicePrefix = "dynamic/")),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+  test.start();
+
+  auto missing = admin.removeWorker("dynamic/none");
+  KJ_EXPECT(missing.status == admin::RemoveWorkerResult::NOT_FOUND);
+
+  auto isStatic = admin.removeWorker("backend");
+  KJ_EXPECT(isStatic.status == admin::RemoveWorkerResult::RESTART_REQUIRED, isStatic.message);
+
+  auto added = admin.addWorker("dynamic/app", "one"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('one'); } }"_kj);
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+  expectRoute(test, "app", "one");
+  KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 2);
+
+  auto conflicting = admin.addWorker("dynamic/app", "two"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('two'); } }"_kj);
+  });
+  KJ_EXPECT(conflicting.status == admin::AddWorkerResult::RESTART_REQUIRED, conflicting.message);
+
+  auto removed = admin.removeWorker("dynamic/app");
+  KJ_EXPECT(removed.status == admin::RemoveWorkerResult::REMOVED);
+  expectRouteUnavailable(test, "app");
+  KJ_EXPECT(!test.server.hasDynamicWorkerStateForTest("dynamic/app"));
+
+  kj::yieldUntilQueueEmpty().wait(test.ws);
+  KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 1);
+
+  auto readded = admin.addWorker("dynamic/app", "two"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('two'); } }"_kj);
+  });
+  KJ_EXPECT(readded.status == admin::AddWorkerResult::ADDED, readded.message);
+  expectRoute(test, "app", "two");
+
+  auto again = admin.removeWorker("dynamic/app");
+  KJ_EXPECT(again.status == admin::RemoveWorkerResult::REMOVED);
+  auto gone = admin.removeWorker("dynamic/app");
+  KJ_EXPECT(gone.status == admin::RemoveWorkerResult::NOT_FOUND);
+}
+
+KJ_TEST("Server: removeWorker drains in-flight requests and waitUntil tasks") {
+  TestServer test(R"((
+    services = [
+      (name = "requestBlocker", external = "remove-request"),
+      (name = "waitUntilBlocker", external = "remove-wait-until"),
+      (name = "ingress", workerRouter = (header = "X-Worker-Route", servicePrefix = "dynamic/")),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+  test.start();
+
+  auto added = admin.addWorker("dynamic/app", "one"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        async fetch(request, env, ctx) {
+          ctx.waitUntil(env.WAIT.fetch("http://remove-wait-until/"));
+          await env.REQ.fetch("http://remove-request/");
+          return new Response("slow");
+        }
+      }
+    )"_kj);
+    auto bindings = worker.initBindings(2);
+    bindings[0].setName("WAIT");
+    bindings[0].initService().setName("waitUntilBlocker");
+    bindings[1].setName("REQ");
+    bindings[1].initService().setName("requestBlocker");
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+
+  auto conn = test.connect("test-addr");
+  conn.send(kj::str("GET / HTTP/1.1\nHost: example.com\nX-Worker-Route: app\n\n"));
+  auto waitUntilRequest = test.receiveSubrequest("remove-wait-until");
+  auto inFlightRequest = test.receiveSubrequest("remove-request");
+
+  auto removed = admin.removeWorker("dynamic/app");
+  KJ_EXPECT(removed.status == admin::RemoveWorkerResult::REMOVED);
+  expectRouteUnavailable(test, "app");
+
+  // The name is free for a replacement while the old worker still drains.
+  auto readded = admin.addWorker("dynamic/app", "two"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('two'); } }"_kj);
+  });
+  KJ_EXPECT(readded.status == admin::AddWorkerResult::ADDED, readded.message);
+  expectRoute(test, "app", "two");
+  KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 2);
+
+  // The in-flight request completes even though its worker was removed.
+  inFlightRequest.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  conn.recvHttp200("slow");
+
+  // The waitUntil task still holds the removed worker alive.
+  kj::yieldUntilQueueEmpty().wait(test.ws);
+  KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 2);
+
+  waitUntilRequest.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  kj::yieldUntilQueueEmpty().wait(test.ws);
+  KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 1);
+}
+
+KJ_TEST("Server: shutdown drain waits for a removed worker") {
+  TestServer test(R"((
+    services = [
+      (name = "blocker", external = "removed-wait-until"),
+      (name = "ingress", workerRouter = (header = "X-Worker-Route", servicePrefix = "dynamic/")),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  auto added = admin.addWorker("dynamic/app", "one"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        fetch(request, env, ctx) {
+          ctx.waitUntil(env.BLOCKER.fetch("http://removed-wait-until/"));
+          return new Response("done");
+        }
+      }
+    )"_kj);
+    auto binding = worker.initBindings(1)[0];
+    binding.setName("BLOCKER");
+    binding.initService().setName("blocker");
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+
+  expectRoute(test, "app", "done");
+  auto subrequest = test.receiveSubrequest("removed-wait-until");
+
+  auto removed = admin.removeWorker("dynamic/app");
+  KJ_EXPECT(removed.status == admin::RemoveWorkerResult::REMOVED);
+
+  drain.fulfiller->fulfill();
+  KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+
+  subrequest.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: a binding to a removed worker fails gracefully") {
+  TestServer test(R"((
+    services = [
+      (name = "ingress", workerRouter = (header = "X-Worker-Route", servicePrefix = "dynamic/")),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+  test.start();
+
+  auto callee = admin.addWorker("dynamic/callee", "callee"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('callee'); } }"_kj);
+  });
+  KJ_EXPECT(callee.status == admin::AddWorkerResult::ADDED, callee.message);
+
+  auto caller = admin.addWorker("dynamic/caller", "caller"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        async fetch(request, env) {
+          try {
+            return await env.CALLEE.fetch("http://placeholder/");
+          } catch (exception) {
+            return new Response(exception.message.includes("has been removed")
+                ? "refused" : `unexpected: ${exception.message}`);
+          }
+        }
+      }
+    )"_kj);
+    auto binding = worker.initBindings(1)[0];
+    binding.setName("CALLEE");
+    binding.initService().setName("dynamic/callee");
+  });
+  KJ_EXPECT(caller.status == admin::AddWorkerResult::ADDED, caller.message);
+
+  expectRoute(test, "caller", "callee");
+
+  auto removed = admin.removeWorker("dynamic/callee");
+  KJ_EXPECT(removed.status == admin::RemoveWorkerResult::REMOVED);
+  kj::yieldUntilQueueEmpty().wait(test.ws);
+
+  // The caller's binding pins the removed worker's shell, but invocations are refused.
+  KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 2);
+  expectRoute(test, "caller", "refused");
 }
 
 KJ_TEST("Server: fatal task failure bypasses waitUntil drain") {

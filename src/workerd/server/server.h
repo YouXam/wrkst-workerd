@@ -139,6 +139,11 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
     return services.find(name) != kj::none || actorConfigs.find(name) != kj::none;
   }
 
+  // Counts live WorkerService objects, including removed workers that are still draining.
+  size_t getWorkerServiceCountForTest() {
+    return workerServices.size();
+  }
+
   void deleteAllActorsForTest() {
     deleteAllActors(kj::none);
   }
@@ -266,6 +271,10 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   // request in flight.
   kj::Promise<void> handleDrain(kj::Promise<void> drainWhen);
   kj::Promise<void> drainTasks();
+
+  // Waits until a worker taken out of `services` by the admin interface has no in-flight
+  // requests and no waitUntil tasks, then unlinks and destroys it. Runs in `tasks`.
+  kj::Promise<void> drainRemovedWorker(kj::Own<WorkerService> worker);
 
   kj::Own<kj::TlsContext> makeTlsContext(config::TlsOptions::Reader conf);
   kj::Promise<kj::Own<kj::NetworkAddress>> makeTlsNetworkAddress(config::TlsOptions::Reader conf,

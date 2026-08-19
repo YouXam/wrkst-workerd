@@ -3959,6 +3959,33 @@ class Server::WorkerService final: public Service,
     return waitUntilTasks.onEmpty().attach(kj::addRef(*this));
   }
 
+  // Marks this worker as removed by the admin interface: invocations refuse from here on, while
+  // work that is already running keeps its I/O channels until the removal drain unlinks them.
+  void beginRemoval() {
+    removed = true;
+  }
+
+  // True once beginRemoval() ran. The shutdown drain skips removed workers because their
+  // waitUntilTasks.onEmpty() (single waiter) is owned by the removal drain task, which the
+  // shutdown drain already awaits through `Server::tasks`.
+  bool isRemoved() {
+    return removed;
+  }
+
+  bool hasActiveRequests() {
+    return activeRequestCount > 0;
+  }
+
+  // Resolves once every WorkerInterface handed out by startRequest() has been dropped. Only the
+  // removal drain waits on this, so a single fulfiller slot suffices.
+  kj::Promise<void> onRequestsEmpty() {
+    if (activeRequestCount == 0) return kj::READY_NOW;
+    KJ_REQUIRE(requestsEmptyFulfiller == kj::none, "onRequestsEmpty() already has a waiter");
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    requestsEmptyFulfiller = kj::mv(paf.fulfiller);
+    return paf.promise.attach(kj::addRef(*this));
+  }
+
   kj::Maybe<kj::Promise<void>> revokeLocalActorStorage(kj::Exception reason) {
     kj::Vector<kj::Promise<void>> promises;
     for (auto& namespaceEntry: actorNamespaces) {
@@ -4126,6 +4153,10 @@ class Server::WorkerService final: public Service,
       bool isTracer = false) {
     TRACE_EVENT("workerd", "Server::WorkerService::startRequest()");
 
+    // The guard counts this invocation for the removal drain until the returned WorkerInterface
+    // is dropped.
+    auto guard = kj::heap<RequestGuard>(*this);
+
     KJ_IF_SOME(headerName, accessBlobHeaderName) {
       // This worker has an accessBlobHeader configured. Defer entrypoint creation until
       // request() is called, so the access blob header can be extracted from the HTTP headers
@@ -4137,11 +4168,12 @@ class Server::WorkerService final: public Service,
               kj::Maybe<kj::Own<AccessInfo>> accessInfo) mutable -> kj::Own<WorkerInterface> {
         return createEntrypoint(kj::mv(metadata), entrypointName, kj::mv(props), kj::mv(actor),
             isTracer, kj::mv(accessInfo));
-      });
+      }).attach(kj::mv(guard));
     }
 
     return createEntrypoint(
-        kj::mv(metadata), entrypointName, kj::mv(props), kj::mv(actor), isTracer, kj::none);
+        kj::mv(metadata), entrypointName, kj::mv(props), kj::mv(actor), isTracer, kj::none)
+        .attach(kj::mv(guard));
   }
 
   kj::Own<WorkerInterface> createEntrypoint(IoChannelFactory::SubrequestMetadata metadata,
@@ -4150,6 +4182,10 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Own<Worker::Actor>> actor,
       bool isTracer,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo) {
+    // Checked before touching ioChannels: a caller that kept a binding to this worker across its
+    // removal must get a catchable error, and after the removal drain the channels are gone.
+    JSG_REQUIRE(!removed, Error, "Cannot dispatch to a Worker that has been removed.");
+
     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
 
     kj::Vector<kj::Own<WorkerInterface>> bufferedTailWorkers(channels.tails.size());
@@ -4528,6 +4564,31 @@ class Server::WorkerService final: public Service,
   kj::Maybe<kj::String> accessBlobHeaderName;
   kj::Maybe<kj::uint> accessBindingServiceChannel;
   ListedWorkerService drainRegistration;
+
+  // Keeps one invocation counted (and the service alive) while a WorkerInterface handed out by
+  // startRequest() exists, and wakes the removal drain when the last one is dropped.
+  class RequestGuard {
+   public:
+    RequestGuard(WorkerService& service): service(kj::addRef(service)) {
+      ++service.activeRequestCount;
+    }
+    ~RequestGuard() {
+      if (--service->activeRequestCount == 0) {
+        KJ_IF_SOME(fulfiller, service->requestsEmptyFulfiller) {
+          fulfiller->fulfill();
+          service->requestsEmptyFulfiller = kj::none;
+        }
+      }
+    }
+    KJ_DISALLOW_COPY_AND_MOVE(RequestGuard);
+
+   private:
+    kj::Own<WorkerService> service;
+  };
+
+  bool removed = false;
+  uint activeRequestCount = 0;
+  kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> requestsEmptyFulfiller;
 
   // ---------------------------------------------------------------------------
   // implements kj::TaskSet::ErrorHandler
@@ -5169,6 +5230,47 @@ class Server::AdminService {
       context.getResults().initResult().setAdded();
     }
 
+    kj::Promise<void> removeWorker(RemoveWorkerContext context) override {
+      auto serviceNameParam = context.getParams().getServiceName();
+
+      if (serviceNameParam.size() == 0 || serviceNameParam.size() > MAX_SERVICE_NAME_BYTES) {
+        context.getResults().initResult().setError(
+            "serviceName must contain between 1 and 1024 bytes.");
+        co_return;
+      }
+      auto serviceName = kj::str(serviceNameParam);
+
+      auto turn = KJ_UNWRAP_OR(tryGetTurn(), {
+        context.getResults().initResult().setError("removeWorker queue is full.");
+        co_return;
+      });
+      KJ_DEFER(turn.done->fulfill());
+      co_await turn.ready;
+
+      if (loadedDigests.find(serviceName) == kj::none) {
+        if (owner.services.find(serviceName) == kj::none) {
+          context.getResults().initResult().setNotFound();
+        } else {
+          context.getResults().initResult().setRestartRequired(
+              "Only dynamically-added Workers can be removed.");
+        }
+        co_return;
+      }
+
+      // Everything below is synchronous, so a cancelled RPC cannot leave the removal half-done.
+      // Once the maps are clean the serviceName is free for a fresh addWorker() even while the
+      // old worker still drains.
+      auto& entry = KJ_ASSERT_NONNULL(owner.services.findEntry(serviceName));
+      auto releasedEntry = owner.services.release(entry);
+      auto worker = kj::mv(releasedEntry.value).downcast<WorkerService>();
+      loadedDigests.erase(serviceName);
+      owner.actorConfigs.erase(serviceName);
+
+      worker->beginRemoval();
+      owner.tasks.add(owner.drainRemovedWorker(kj::mv(worker)));
+      context.getResults().initResult().setRemoved();
+    }
+
    private:
     static constexpr size_t MAX_SERVICE_NAME_BYTES = 1024;
     static constexpr size_t MAX_DIGEST_BYTES = 64;
@@ -5177,7 +5279,7 @@ class Server::AdminService {
     static constexpr uint MAX_DYNAMIC_BINDING_NODES = 4096;
     static constexpr uint MAX_DYNAMIC_NESTED_ITEMS = 4096;
     static constexpr uint MAX_DYNAMIC_WRAPPED_DEPTH = 16;
-    static constexpr uint MAX_PENDING_ADDS = 4;
+    static constexpr uint MAX_PENDING_MUTATIONS = 4;
 
     struct DynamicWorkerBacking {
       DynamicWorkerBacking(kj::StringPtr serviceName, config::Worker::Reader worker)
@@ -5194,7 +5296,7 @@ class Server::AdminService {
       kj::Own<kj::PromiseFulfiller<void>> done;
     };
 
-    struct PendingAdds final: public kj::Refcounted {
+    struct PendingMutations final: public kj::Refcounted {
       uint count = 0;
     };
 
@@ -5202,19 +5304,21 @@ class Server::AdminService {
     capnp::List<config::Extension>::Reader extensions;
     kj::HashMap<kj::String, kj::Array<byte>> loadedDigests;
     kj::ForkedPromise<void> mutationQueue;
-    kj::Rc<PendingAdds> pendingAdds = kj::rc<PendingAdds>();
+    kj::Rc<PendingMutations> pendingMutations = kj::rc<PendingMutations>();
 
     kj::Maybe<RpcTurn> tryGetTurn() {
-      if (pendingAdds->count >= MAX_PENDING_ADDS) return kj::none;
+      if (pendingMutations->count >= MAX_PENDING_MUTATIONS) return kj::none;
 
-      ++pendingAdds->count;
+      ++pendingMutations->count;
       auto paf = kj::newPromiseAndFulfiller<void>();
       auto previous = mutationQueue.addBranch().fork();
       auto ready = previous.addBranch();
       mutationQueue =
           previous.addBranch()
               .then([completion = kj::mv(paf.promise)]() mutable { return kj::mv(completion); })
-              .then([pendingAdds = pendingAdds.addRef()]() mutable { --pendingAdds->count; })
+              .then([pendingMutations = pendingMutations.addRef()]() mutable {
+        --pendingMutations->count;
+      })
               .eagerlyEvaluate(nullptr)
               .fork();
       return RpcTurn{kj::mv(ready), kj::mv(paf.fulfiller)};
@@ -7597,7 +7701,9 @@ kj::Promise<void> Server::drainTasks() {
       promises.add(tasks.onEmpty());
     }
     for (auto& listed: workerServices) {
-      if (listed.workerService.hasWaitUntilTasks()) {
+      // A removed worker's waitUntil drain belongs to its drainRemovedWorker() task, which is
+      // covered through `tasks` above; onWaitUntilTasksEmpty() supports only one waiter.
+      if (!listed.workerService.isRemoved() && listed.workerService.hasWaitUntilTasks()) {
         promises.add(listed.workerService.onWaitUntilTasksEmpty());
       }
     }
@@ -7627,6 +7733,34 @@ kj::Promise<void> Server::drainTasks() {
     }
     if (allWaitUntilTasksEmpty) co_return;
   }
+}
+
+kj::Promise<void> Server::drainRemovedWorker(kj::Own<WorkerService> worker) {
+  // Unlink even when this task is cancelled by server teardown: the worker's channel references
+  // (including ctx.exports self-references) must be dropped either way, and unlink() is
+  // idempotent.
+  KJ_DEFER(worker->unlink());
+
+  try {
+    // Requests can enqueue waitUntil tasks and waitUntil tasks can start requests (loopback
+    // bindings, tail workers), so loop until both are observed empty at once.
+    for (;;) {
+      while (worker->hasActiveRequests()) {
+        co_await worker->onRequestsEmpty();
+      }
+      while (worker->hasWaitUntilTasks()) {
+        co_await worker->onWaitUntilTasksEmpty();
+      }
+      if (!worker->hasActiveRequests() && !worker->hasWaitUntilTasks()) break;
+    }
+  } catch (...) {
+    // The drain must not take the server down through taskFailed(); proceed to teardown.
+    KJ_LOG(ERROR, "removed worker drain failed", kj::getCaughtExceptionAsKj());
+  }
+
+  // Give the teardown a turn of its own so it cannot run inside the same turn that finished the
+  // worker's last request. (Same caution as WorkerStubImpl::~WorkerStubImpl().)
+  co_await kj::evalLater([]() {});
 }
 
 kj::Promise<void> Server::run(
