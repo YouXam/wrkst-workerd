@@ -70,6 +70,12 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
+      - name: Stamp the release version
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: echo "$VERSION" > src/workerd/io/release-version.txt
+
       - name: Report runner resources
         shell: bash
         run: |
@@ -114,10 +120,12 @@ jobs:
 
       - name: Verify binary
         shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           test "$RUNNER_ARCH" = "${{ matrix.runner-arch }}"
           file bazel-bin/src/workerd/server/workerd
-          bazel-bin/src/workerd/server/workerd --version
+          bazel-bin/src/workerd/server/workerd --version | tee /dev/stderr | grep -F "workerd $VERSION"
 
       - name: Upload binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
