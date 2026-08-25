@@ -4279,7 +4279,8 @@ class Server::WorkerService final: public Service,
       }
       auto tailStreamWriter = tracing::initializeTailStreamWriter(
           streamingTailWorkers.releaseAsArray(), waitUntilTasks);
-      auto trace = kj::refcounted<Trace>(kj::none /* stableId */, kj::none /* scriptName */,
+      auto trace = kj::refcounted<Trace>(kj::none /* stableId */,
+          serviceName.map([](const kj::String& name) { return kj::str(name); }),
           kj::none /* scriptVersion */, kj::none /* dispatchNamespace */, kj::none /* scriptId */,
           nullptr /* scriptTags */, mapCopyString(entrypointName), executionModel,
           kj::mv(durableObjectId));
