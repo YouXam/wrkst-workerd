@@ -3376,8 +3376,8 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
         auto time = ioContext.now();
         t->recordTimestamp(time);
       }
-      t->setOutcome(
-          outcome, 0 * kj::MILLISECONDS /* cpu time */, 0 * kj::MILLISECONDS /* wall time */);
+      auto wallTime = kj::systemPreciseCalendarClock().now() - startTime;
+      t->setOutcome(outcome, 0 * kj::MILLISECONDS /* cpu time */, wallTime);
     }
   }
 
@@ -3502,6 +3502,7 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
   kj::Maybe<kj::Own<WorkerTracer>> tracer;
   kj::Maybe<WorkerInterface&> inner;
   EventOutcome outcome = EventOutcome::OK;
+  kj::Date startTime = kj::systemPreciseCalendarClock().now();
 };
 
 class SequentialSpanSubmitter final: public SpanSubmitter {
