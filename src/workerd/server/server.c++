@@ -5302,8 +5302,101 @@ class Server::AdminService {
       context.getResults().initResult().setRemoved();
     }
 
+    kj::Promise<void> dispatchScheduled(DispatchScheduledContext context) override {
+      auto params = context.getParams();
+      auto serviceNameParam = params.getServiceName();
+      auto result = context.getResults().initResult();
+
+      if (serviceNameParam.size() == 0 || serviceNameParam.size() > MAX_SERVICE_NAME_BYTES) {
+        result.setError("serviceName must contain between 1 and 1024 bytes.");
+        return kj::READY_NOW;
+      }
+      if (params.getCron().size() > MAX_CRON_BYTES) {
+        result.setError("cron must contain at most 1024 bytes.");
+        return kj::READY_NOW;
+      }
+      if (params.getScheduledTimeMs() < 0 || params.getScheduledTimeMs() > MAX_SCHEDULED_TIME_MS) {
+        result.setError("scheduledTimeMs is out of range.");
+        return kj::READY_NOW;
+      }
+
+      WorkerService* workerService = nullptr;
+      KJ_IF_SOME(service, owner.services.find(serviceNameParam)) {
+        KJ_IF_SOME(w, kj::tryDowncast<WorkerService>(*service)) {
+          workerService = &w;
+        }
+      }
+      if (workerService == nullptr) {
+        result.setNotFound();
+        return kj::READY_NOW;
+      }
+      auto entrypoint = KJ_ASSERT_NONNULL(workerService->getEntrypoint(kj::none, Frankenvalue()));
+      if (!entrypoint->hasHandler("scheduled")) {
+        result.setNoHandler();
+        return kj::READY_NOW;
+      }
+
+      auto worker = entrypoint->startRequest({});
+      auto cron = kj::str(params.getCron());
+      kj::Date scheduledTime = kj::UNIX_EPOCH + params.getScheduledTimeMs() * kj::MILLISECONDS;
+      auto execution = worker->runScheduled(scheduledTime, cron)
+                           .then([](WorkerInterface::ScheduledResult scheduledResult) {
+        return SettledDispatch{.result = scheduledResult, .deadlineExceeded = false};
+      });
+      uint32_t deadlineMs = params.getDeadlineMs();
+      if (deadlineMs > 0) {
+        // Losing the join cancels the event's execution outright.
+        execution = execution.exclusiveJoin(
+            owner.timer.afterDelay(deadlineMs * kj::MILLISECONDS).then([]() {
+          return SettledDispatch{
+            .result = {.retry = true, .outcome = EventOutcome::EXCEEDED_WALL_TIME},
+            .deadlineExceeded = true,
+          };
+        }));
+      }
+
+      // The cron string is read while the event runs, and the WorkerInterface holds the
+      // RequestGuard the removal drain counts, so both must live exactly as long as the
+      // execution: attach them before it forks.
+      auto forked = execution.attach(kj::mv(cron), kj::mv(worker)).fork();
+
+      // The detached branch runs the event independently of this RPC and puts it under the exit
+      // drain via `tasks`; a settlement failure must not become taskFailed()'s fatal exit.
+      owner.tasks.add(forked.addBranch().ignoreResult().catch_([](kj::Exception&& exception) {
+        KJ_LOG(ERROR, "dispatched scheduled event failed", exception);
+      }));
+
+      result.setAccepted(kj::heap<ScheduledCompletionImpl>(forked.addBranch()));
+      return kj::READY_NOW;
+    }
+
    private:
     static constexpr size_t MAX_SERVICE_NAME_BYTES = 1024;
+    static constexpr size_t MAX_CRON_BYTES = 1024;
+    // Bounds scheduledTimeMs so converting it to a nanosecond-granularity kj::Duration cannot
+    // overflow.
+    static constexpr int64_t MAX_SCHEDULED_TIME_MS = 9'000'000'000'000;
+
+    struct SettledDispatch {
+      WorkerInterface::ScheduledResult result;
+      bool deadlineExceeded;
+    };
+
+    class ScheduledCompletionImpl final: public admin::ScheduledCompletion::Server {
+     public:
+      ScheduledCompletionImpl(kj::Promise<SettledDispatch> settled): settled(settled.fork()) {}
+
+      kj::Promise<void> wait(WaitContext context) override {
+        auto settlement = co_await settled.addBranch();
+        auto results = context.getResults();
+        results.setOutcome(kj::str(settlement.result.outcome));
+        results.setRetry(settlement.result.retry);
+        results.setDeadlineExceeded(settlement.deadlineExceeded);
+      }
+
+     private:
+      kj::ForkedPromise<SettledDispatch> settled;
+    };
     static constexpr size_t MAX_DIGEST_BYTES = 64;
     static constexpr uint64_t MAX_WORKER_WORDS = 24 * 1024 * 1024 / sizeof(capnp::word);
     static constexpr uint MAX_DYNAMIC_MODULES = 4096;

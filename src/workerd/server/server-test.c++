@@ -650,6 +650,18 @@ struct AdminRemoveResult {
   kj::String message;
 };
 
+struct AdminDispatchResult {
+  admin::DispatchScheduledResult::Which status;
+  kj::String message;
+  kj::Maybe<admin::ScheduledCompletion::Client> completion;
+};
+
+struct ScheduledOutcome {
+  kj::String outcome;
+  bool retry;
+  bool deadlineExceeded;
+};
+
 class TestAdminClient {
  public:
   TestAdminClient(TestServer& test): TestAdminClient(test, kj::newTwoWayPipe()) {}
@@ -682,6 +694,34 @@ class TestAdminClient {
         return {result.which(), kj::str(result.getError())};
     }
     KJ_UNREACHABLE;
+  }
+
+  AdminDispatchResult dispatchScheduled(kj::StringPtr serviceName,
+      kj::StringPtr cron = ""_kj,
+      int64_t scheduledTimeMs = 0,
+      uint32_t deadlineMs = 0) {
+    auto request = client.dispatchScheduledRequest();
+    request.setServiceName(serviceName);
+    request.setCron(cron);
+    request.setScheduledTimeMs(scheduledTimeMs);
+    request.setDeadlineMs(deadlineMs);
+    auto response = request.send().wait(ws);
+    auto result = response.getResult();
+    switch (result.which()) {
+      case admin::DispatchScheduledResult::ACCEPTED:
+        return {result.which(), kj::str(""), result.getAccepted()};
+      case admin::DispatchScheduledResult::NOT_FOUND:
+      case admin::DispatchScheduledResult::NO_HANDLER:
+        return {result.which(), kj::str(""), kj::none};
+      case admin::DispatchScheduledResult::ERROR:
+        return {result.which(), kj::str(result.getError()), kj::none};
+    }
+    KJ_UNREACHABLE;
+  }
+
+  ScheduledOutcome waitScheduled(admin::ScheduledCompletion::Client completion) {
+    auto response = completion.waitRequest().send().wait(ws);
+    return {kj::str(response.getOutcome()), response.getRetry(), response.getDeadlineExceeded()};
   }
 
   admin::WorkerdAdmin::Client& getClient() {
@@ -5386,6 +5426,257 @@ KJ_TEST("Server: a binding to a removed worker fails gracefully") {
   // The caller's binding pins the removed worker's shell, but invocations are refused.
   KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 2);
   expectRoute(test, "caller", "refused");
+}
+
+KJ_TEST("Server: admin dispatchScheduled delivers a scheduled event") {
+  TestServer test(R"((
+    services = [(name = "ingress", workerRouter = (header = "X-Worker-Route"))],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+  test.start();
+
+  auto added = admin.addWorker("dynamic/cron", "one"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        async scheduled(ctrl, env, ctx) {
+          if (ctrl.scheduledTime !== 1234567890123) throw new Error("wrong scheduledTime");
+          if (ctrl.cron === "boom") throw new Error("boom");
+          if (ctrl.cron === "0 0 * * *") ctrl.noRetry();
+        }
+      }
+    )"_kj);
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+
+  {
+    auto dispatched = admin.dispatchScheduled("dynamic/cron", "* * * * *", 1234567890123);
+    KJ_EXPECT(dispatched.status == admin::DispatchScheduledResult::ACCEPTED, dispatched.message);
+    auto outcome = admin.waitScheduled(KJ_ASSERT_NONNULL(dispatched.completion));
+    KJ_EXPECT(outcome.outcome == "ok", outcome.outcome);
+    KJ_EXPECT(outcome.retry);
+    KJ_EXPECT(!outcome.deadlineExceeded);
+  }
+
+  {
+    auto dispatched = admin.dispatchScheduled("dynamic/cron", "0 0 * * *", 1234567890123);
+    KJ_EXPECT(dispatched.status == admin::DispatchScheduledResult::ACCEPTED, dispatched.message);
+    auto outcome = admin.waitScheduled(KJ_ASSERT_NONNULL(dispatched.completion));
+    KJ_EXPECT(outcome.outcome == "ok", outcome.outcome);
+    KJ_EXPECT(!outcome.retry);
+  }
+
+  {
+    auto dispatched = admin.dispatchScheduled("dynamic/cron", "boom", 1234567890123);
+    KJ_EXPECT(dispatched.status == admin::DispatchScheduledResult::ACCEPTED, dispatched.message);
+    auto outcome = admin.waitScheduled(KJ_ASSERT_NONNULL(dispatched.completion));
+    KJ_EXPECT(outcome.outcome == "exception", outcome.outcome);
+    KJ_EXPECT(outcome.retry);
+  }
+
+  auto missing = admin.dispatchScheduled("dynamic/none");
+  KJ_EXPECT(missing.status == admin::DispatchScheduledResult::NOT_FOUND);
+
+  auto fetchOnly =
+      admin.addWorker("dynamic/fetch-only", "two"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, "export default { fetch() { return new Response('hi'); } }"_kj);
+  });
+  KJ_EXPECT(fetchOnly.status == admin::AddWorkerResult::ADDED, fetchOnly.message);
+  auto unhandled = admin.dispatchScheduled("dynamic/fetch-only");
+  KJ_EXPECT(unhandled.status == admin::DispatchScheduledResult::NO_HANDLER);
+
+  auto invalid = admin.dispatchScheduled("");
+  KJ_EXPECT(invalid.status == admin::DispatchScheduledResult::ERROR, invalid.message);
+}
+
+KJ_TEST("Server: a dispatched scheduled event runs detached from its completion capability") {
+  TestServer test(R"((
+    services = [
+      (name = "blocker", external = "dispatch-blocker"),
+      (name = "signal", external = "dispatch-signal"),
+      (name = "ingress", workerRouter = (header = "X-Worker-Route")),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+  test.start();
+
+  auto added = admin.addWorker("dynamic/cron", "one"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        async scheduled(ctrl, env, ctx) {
+          await env.BLOCKER.fetch("http://dispatch-blocker/");
+          if (ctrl.cron !== "*/5 * * * *") throw new Error("cron lost");
+          await env.SIGNAL.fetch("http://dispatch-signal/");
+        }
+      }
+    )"_kj);
+    auto bindings = worker.initBindings(2);
+    bindings[0].setName("BLOCKER");
+    bindings[0].initService().setName("blocker");
+    bindings[1].setName("SIGNAL");
+    bindings[1].initService().setName("signal");
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+
+  {
+    auto request = admin.getClient().dispatchScheduledRequest();
+    request.setServiceName("dynamic/cron");
+    request.setCron("*/5 * * * *");
+    // The RPC is dropped right after sending: its cancellation follows the call on the wire, and
+    // the completion capability in the response is never extracted, so both are released before
+    // the event settles.
+    auto canceled = request.send();
+  }
+
+  auto blocked = test.receiveSubrequest("dispatch-blocker");
+  blocked.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+
+  // The handler resumed after the drop: it read its cron string (owned by the server, not the
+  // already-freed RPC params) and reached the second subrequest.
+  auto signaled = test.receiveSubrequest("dispatch-signal");
+  signaled.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+}
+
+KJ_TEST("Server: shutdown drain waits for a dispatched scheduled event") {
+  TestServer test(R"((
+    services = [
+      (name = "blocker", external = "dispatch-drain"),
+      (name = "ingress", workerRouter = (header = "X-Worker-Route")),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  auto added = admin.addWorker("dynamic/cron", "one"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        async scheduled(ctrl, env, ctx) {
+          await env.BLOCKER.fetch("http://dispatch-drain/");
+        }
+      }
+    )"_kj);
+    auto binding = worker.initBindings(1)[0];
+    binding.setName("BLOCKER");
+    binding.initService().setName("blocker");
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+
+  auto dispatched = admin.dispatchScheduled("dynamic/cron");
+  KJ_EXPECT(dispatched.status == admin::DispatchScheduledResult::ACCEPTED, dispatched.message);
+  auto blocked = test.receiveSubrequest("dispatch-drain");
+
+  // The drain closes the admin connection, but the dispatched event keeps the server alive.
+  drain.fulfiller->fulfill();
+  KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+
+  blocked.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: removeWorker waits for a dispatched scheduled event") {
+  TestServer test(R"((
+    services = [
+      (name = "blocker", external = "dispatch-remove"),
+      (name = "ingress", workerRouter = (header = "X-Worker-Route")),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+  test.start();
+
+  auto added = admin.addWorker("dynamic/cron", "one"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        async scheduled(ctrl, env, ctx) {
+          await env.BLOCKER.fetch("http://dispatch-remove/");
+        }
+      }
+    )"_kj);
+    auto binding = worker.initBindings(1)[0];
+    binding.setName("BLOCKER");
+    binding.initService().setName("blocker");
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+
+  auto dispatched = admin.dispatchScheduled("dynamic/cron");
+  KJ_EXPECT(dispatched.status == admin::DispatchScheduledResult::ACCEPTED, dispatched.message);
+  auto blocked = test.receiveSubrequest("dispatch-remove");
+
+  auto removed = admin.removeWorker("dynamic/cron");
+  KJ_EXPECT(removed.status == admin::RemoveWorkerResult::REMOVED);
+
+  // The dispatched event counts as an in-flight request, so the removal drain keeps the worker.
+  kj::yieldUntilQueueEmpty().wait(test.ws);
+  KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 1);
+
+  blocked.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  auto outcome = admin.waitScheduled(KJ_ASSERT_NONNULL(dispatched.completion));
+  KJ_EXPECT(outcome.outcome == "ok", outcome.outcome);
+
+  // Settlement released the invocation guard, so the removal drain finishes even while the
+  // completion capability stays held.
+  kj::yieldUntilQueueEmpty().wait(test.ws);
+  KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 0);
+}
+
+KJ_TEST("Server: dispatchScheduled deadline cancels a stuck event") {
+  TestServer test(R"((
+    services = [(name = "ingress", workerRouter = (header = "X-Worker-Route"))],
+    sockets = [(name = "main", address = "test-addr", service = "ingress")],
+  ))"_kj);
+  TestAdminClient admin(test);
+  test.start();
+
+  auto added = admin.addWorker("dynamic/cron", "one"_kjb, [](config::Worker::Builder worker) {
+    initModuleWorker(worker, R"(
+      export default {
+        async scheduled(ctrl, env, ctx) {
+          await new Promise(resolve => setTimeout(resolve, 3600000));
+        }
+      }
+    )"_kj);
+  });
+  KJ_EXPECT(added.status == admin::AddWorkerResult::ADDED, added.message);
+
+  auto dispatched = admin.dispatchScheduled("dynamic/cron", ""_kj, 0, 5000);
+  KJ_EXPECT(dispatched.status == admin::DispatchScheduledResult::ACCEPTED, dispatched.message);
+
+  auto pendingWait =
+      KJ_ASSERT_NONNULL(dispatched.completion).waitRequest().send().eagerlyEvaluate(nullptr);
+  KJ_EXPECT(!pendingWait.poll(test.ws));
+
+  test.wait(6);
+  auto outcome = pendingWait.wait(test.ws);
+  KJ_EXPECT(outcome.getDeadlineExceeded());
+  KJ_EXPECT(kj::str(outcome.getOutcome()) == "exceededWallTime", outcome.getOutcome());
+  KJ_EXPECT(outcome.getRetry());
+
+  // The cancellation released the event's invocation guard: the worker's removal drain finishes
+  // without the handler's one-hour timer ever firing.
+  auto removed = admin.removeWorker("dynamic/cron");
+  KJ_EXPECT(removed.status == admin::RemoveWorkerResult::REMOVED);
+  kj::yieldUntilQueueEmpty().wait(test.ws);
+  KJ_EXPECT(test.server.getWorkerServiceCountForTest() == 0);
 }
 
 KJ_TEST("Server: fatal task failure bypasses waitUntil drain") {
