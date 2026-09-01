@@ -372,6 +372,78 @@ Server::~Server() noexcept {
 
 // =======================================================================================
 
+// Close code/reason for the WebSockets the server closes when a drain revokes local actor
+// storage: the process is going away and clients should reconnect to its successor.
+constexpr uint16_t WEB_SOCKET_DRAIN_CLOSE_CODE = 1001;
+constexpr kj::StringPtr WEB_SOCKET_DRAIN_CLOSE_REASON = "Durable Object is shutting down"_kj;
+
+// Custom event that closes every WebSocket a live actor holds — hibernatable and plain accepted
+// alike — through the api layer. It goes through the actor's normal event path because api-level
+// close requires the input gate and IncomingRequest machinery; a delivery failure propagates to
+// the caller, which closes hibernated sockets directly instead.
+class WebSocketDrainCustomEvent final: public WorkerInterface::CustomEvent {
+ public:
+  WebSocketDrainCustomEvent(uint16_t code, kj::StringPtr reason): code(code), reason(reason) {}
+
+  kj::Promise<Result> run(kj::Own<IoContext_IncomingRequest> incomingRequest,
+      kj::Maybe<kj::StringPtr> entrypointName,
+      kj::Maybe<Worker::VersionInfo> versionInfo,
+      Frankenvalue props,
+      kj::TaskSet& waitUntilTasks,
+      bool isDynamicDispatch) override {
+    auto& context = incomingRequest->getContext();
+    incomingRequest->delivered();
+    KJ_DEFER({ incomingRequest->drain(waitUntilTasks, kj::mv(incomingRequest)); });
+
+    co_await context.run([code = code, reason = reason](Worker::Lock& lock, IoContext& context) {
+      jsg::Lock& js = lock;
+      // The WHATWG validation in close() (pedantic_wpt) accepts only 1000 and 3000-4999 from
+      // the JS-facing API, so under that flag degrade 1001 to a normal closure.
+      int effectiveCode = FeatureFlags::get(js).getPedanticWpt() ? 1000 : code;
+      auto& actor = KJ_REQUIRE_NONNULL(context.getActor());
+      KJ_IF_SOME(manager, actor.getHibernationManager()) {
+        // Asking for every socket wakes the hibernated ones, which is fine: the actor is live,
+        // so they wake into a working isolate, and their close events dispatch normally when
+        // the peers echo the close.
+        for (auto& webSocket: manager.getWebSockets(js, kj::none)) {
+          js.tryCatch([&]() {
+            webSocket->close(js, effectiveCode, jsg::USVString(kj::str(reason)));
+          }, [](jsg::Value&& error) {
+            // A socket that cannot close (e.g. already errored) must not stop the sweep.
+          });
+        }
+      }
+      actor.drainCloseAcceptedWebSockets(js, effectiveCode, reason);
+    });
+
+    co_return Result{.outcome = EventOutcome::OK};
+  }
+
+  kj::Promise<Result> sendRpc(capnp::HttpOverCapnpFactory& httpOverCapnpFactory,
+      capnp::ByteStreamFactory& byteStreamFactory,
+      FrankenvalueHandler& frankenvalueHandler,
+      rpc::EventDispatcher::Client dispatcher) override {
+    KJ_UNIMPLEMENTED("the websocket drain event never leaves the process");
+  }
+
+  kj::Promise<Result> notSupported() override {
+    KJ_UNIMPLEMENTED("the websocket drain event never leaves the process");
+  }
+
+  uint16_t getType() override {
+    // Process-internal event type; only reaches RequestObserver metrics, never the wire.
+    return 200;
+  }
+
+  tracing::EventInfo getEventInfo() const override {
+    return tracing::CustomEventInfo();
+  }
+
+ private:
+  uint16_t code;
+  kj::StringPtr reason;
+};
+
 class Server::ActorNamespace final {
  public:
   friend class Server;
@@ -613,6 +685,48 @@ class Server::ActorNamespace final {
           }
         }
       }
+    }
+
+    // Closes this actor tree's WebSockets for a server drain. Completion lands in the
+    // namespace's waitUntilTasks, so the flush never gates the storage revoke or the lease
+    // release.
+    void beginWebSocketDrain() {
+      for (auto& facet: facets) {
+        facet.value->beginWebSocketDrain();
+      }
+      KJ_IF_SOME(a, actor) {
+        // Ask the actor itself, not our `manager` field: that field is only synced from the
+        // actor when the request tracker goes inactive, so it lags for a live, busy actor.
+        kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> managerRef;
+        KJ_IF_SOME(m, a->getHibernationManager()) {
+          managerRef = m.addRef();
+        }
+        if (managerRef == kj::none && !a->hasAcceptedWebSockets()) return;
+        ns.waitUntilTasks.add(dispatchWebSocketDrainEvent()
+                                  .catch_([managerRef = kj::mv(managerRef)](
+                                              kj::Exception&&) mutable -> kj::Promise<void> {
+          // The actor went away between the liveness check and delivery, so no api-layer
+          // close ran; close whatever hibernated sockets remain directly.
+          KJ_IF_SOME(m, managerRef) {
+            auto& manager = *m;
+            return manager
+                .closeAllForDrain(WEB_SOCKET_DRAIN_CLOSE_CODE, WEB_SOCKET_DRAIN_CLOSE_REASON)
+                .attach(kj::mv(m));
+          }
+          return kj::READY_NOW;
+        }).attach(addRef()));
+      } else KJ_IF_SOME(m, manager) {
+        ns.waitUntilTasks.add(
+            m->closeAllForDrain(WEB_SOCKET_DRAIN_CLOSE_CODE, WEB_SOCKET_DRAIN_CLOSE_REASON)
+                .attach(kj::addRef(*m)));
+      }
+    }
+
+    // Callers should `attach` a self-ref, as with startRequest().
+    kj::Promise<void> dispatchWebSocketDrainEvent() {
+      auto worker = co_await startRequest({});
+      co_await worker->customEvent(kj::heap<WebSocketDrainCustomEvent>(
+          WEB_SOCKET_DRAIN_CLOSE_CODE, WEB_SOCKET_DRAIN_CLOSE_REASON));
     }
 
     // Get the actor, starting it if it's not already running.
@@ -1576,6 +1690,12 @@ class Server::ActorNamespace final {
         storageState = StorageState::REVOKED;
         return kj::none;
       case StorageState::ACTIVE: {
+        // WebSocket closes go first, while the actors can still take the drain-close event;
+        // their completion lands in waitUntilTasks, never in the revoke task below.
+        for (auto& actor: actors) {
+          actor.value->beginWebSocketDrain();
+        }
+
         storageStateReason = reason.clone();
         storageState = StorageState::REVOKING;
         cleanupTask = kj::none;

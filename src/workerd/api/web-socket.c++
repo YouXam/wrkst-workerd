@@ -699,6 +699,9 @@ void LegacyWebSocketAdapter::internalAccept(
   auto& native = *farNative;
   auto nativeWs = kj::mv(KJ_ASSERT_NONNULL(native.state.tryGet<AwaitingAcceptanceOrCoupling>()).ws);
   native.state.init<Accepted>(kj::mv(nativeWs), native, IoContext::current());
+  KJ_IF_SOME(actor, IoContext::current().getActor()) {
+    drainRegistration = actor.registerAcceptedWebSocket(shell);
+  }
   return startReadLoop(js, kj::mv(cs));
 }
 
@@ -764,6 +767,36 @@ kj::Promise<void> LegacyWebSocketAdapter::Accepted::createAbortTask(
 LegacyWebSocketAdapter::Accepted::~Accepted() noexcept(false) {
   KJ_IF_SOME(a, actorMetrics) {
     a.get()->webSocketClosed();
+  }
+}
+
+WebSocketDrainRegistration::WebSocketDrainRegistration(
+    kj::Own<WebSocketDrainRegistry> registryParam, WebSocket& shell)
+    : registry(kj::mv(registryParam)),
+      shell(shell) {
+  registry->sockets.add(*this);
+}
+
+WebSocketDrainRegistration::~WebSocketDrainRegistration() noexcept(false) {
+  registry->sockets.remove(*this);
+}
+
+kj::Own<WebSocketDrainRegistration> WebSocketDrainRegistry::add(WebSocket& shell) {
+  return kj::heap<WebSocketDrainRegistration>(kj::addRef(*this), shell);
+}
+
+void WebSocketDrainRegistry::closeAll(jsg::Lock& js, int code, kj::StringPtr reason) {
+  // Pin every shell with a strong ref before closing any of them: close() can allocate and so
+  // trigger GC, and a collected shell would unlink its registration mid-iteration.
+  kj::Vector<jsg::Ref<WebSocket>> targets(sockets.size());
+  for (auto& registration: sockets) {
+    targets.add(jsg::_jsgThis(&registration.shell));
+  }
+  for (auto& webSocket: targets) {
+    js.tryCatch([&]() { webSocket->close(js, code, jsg::USVString(kj::str(reason))); },
+        [](jsg::Value&& error) {
+      // A socket that cannot close (e.g. already errored) must not stop the sweep.
+    });
   }
 }
 

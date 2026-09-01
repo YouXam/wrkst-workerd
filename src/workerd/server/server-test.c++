@@ -5935,6 +5935,299 @@ KJ_TEST("Server: local storage revoke preserves live actor waitUntil work") {
   }
 }
 
+KJ_TEST("Server: drain closes accepted Durable Object WebSockets") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `export default {
+                `  fetch(request, env) {
+                `    return env.NS.get(env.NS.idFromName("ws")).fetch(request);
+                `  }
+                `}
+                `export class Actor extends DurableObject {
+                `  fetch(request) {
+                `    const pair = new WebSocketPair();
+                `    pair[1].accept();
+                `    return new Response(null, {status: 101, webSocket: pair[0]});
+                `  }
+                `}
+          )],
+          bindings = [(name = "NS", durableObjectNamespace = "Actor")],
+          durableObjectNamespaces = [(className = "Actor", uniqueKey = "ws-drain")],
+          durableObjectStorage = (localDisk = "disk"),
+        )
+      ),
+      (name = "disk", disk = (path = "../../do-storage", writable = true)),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj);
+
+  test.root->openSubdir(kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE);
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  {
+    auto conn = test.connect("test-addr");
+    conn.upgradeToWebSocket();
+
+    drain.fulfiller->fulfill();
+    KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+    conn.recvWebSocketClose(1001);
+  }
+
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: drain closes hibernatable WebSockets and close events still dispatch") {
+  TestServer test(R"((
+    services = [
+      (name = "report", external = "ws-close-report"),
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `export default {
+                `  fetch(request, env) {
+                `    return env.NS.get(env.NS.idFromName("ws")).fetch(request);
+                `  }
+                `}
+                `export class Actor extends DurableObject {
+                `  fetch(request) {
+                `    const pair = new WebSocketPair();
+                `    this.ctx.acceptWebSocket(pair[1]);
+                `    return new Response(null, {status: 101, webSocket: pair[0]});
+                `  }
+                `  async webSocketClose(ws, code, reason, wasClean) {
+                `    await this.env.REPORT.fetch(`http://ws-close-report/${code}`);
+                `  }
+                `}
+          )],
+          bindings = [
+            (name = "REPORT", service = "report"),
+            (name = "NS", durableObjectNamespace = "Actor"),
+          ],
+          durableObjectNamespaces = [(className = "Actor", uniqueKey = "ws-drain")],
+          durableObjectStorage = (localDisk = "disk"),
+        )
+      ),
+      (name = "disk", disk = (path = "../../do-storage", writable = true)),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj);
+
+  test.root->openSubdir(kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE);
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  {
+    auto conn = test.connect("test-addr");
+    conn.upgradeToWebSocket();
+
+    drain.fulfiller->fulfill();
+    KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+    conn.recvWebSocketClose(1001);
+
+    // Echo the close so the actor observes a clean client close. The mask flag is set with a
+    // zero key, so the payload bytes are the raw close code 1001.
+    static constexpr kj::byte closeEcho[] = {0x88, 0x82, 0, 0, 0, 0, 0x03, 0xe9};
+    conn.getStream().write(closeEcho).wait(test.ws);
+
+    auto report = test.receiveSubrequest("ws-close-report");
+    report.recv(R"(
+      GET /1001 HTTP/1.1
+      Host: ws-close-report
+
+    )"_blockquote);
+    report.send(R"(
+      HTTP/1.1 200 OK
+      Content-Length: 0
+
+    )"_blockquote);
+  }
+
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: drain closes hibernated WebSockets without waking the actor") {
+  TestServer test(R"((
+    services = [
+      (name = "report", external = "ws-close-report"),
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `export default {
+                `  fetch(request, env) {
+                `    return env.NS.get(env.NS.idFromName("ws")).fetch(request);
+                `  }
+                `}
+                `export class Actor extends DurableObject {
+                `  fetch(request) {
+                `    const pair = new WebSocketPair();
+                `    this.ctx.acceptWebSocket(pair[1]);
+                `    return new Response(null, {status: 101, webSocket: pair[0]});
+                `  }
+                `  async webSocketClose(ws, code, reason, wasClean) {
+                `    await this.env.REPORT.fetch(`http://ws-close-report/${code}`);
+                `  }
+                `}
+          )],
+          bindings = [
+            (name = "REPORT", service = "report"),
+            (name = "NS", durableObjectNamespace = "Actor"),
+          ],
+          durableObjectNamespaces = [(className = "Actor", uniqueKey = "ws-drain")],
+          durableObjectStorage = (localDisk = "disk"),
+        )
+      ),
+      (name = "disk", disk = (path = "../../do-storage", writable = true)),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj);
+
+  test.root->openSubdir(kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE);
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  auto conn = test.connect("test-addr");
+  conn.upgradeToWebSocket();
+
+  // Let the inactivity timer hibernate the WebSocket and tear down the actor.
+  test.wait(11);
+
+  drain.fulfiller->fulfill();
+
+  // The close arrives straight off the hibernated socket: no actor is constructed, so no
+  // close event fires and nothing contacts the report service.
+  conn.recvWebSocketClose(1001);
+
+  // The server aborts the socket once the close frame is out, so the drain finishes without
+  // waiting for the client to hang up.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: drain aborts hibernated WebSockets that were already closed") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `export default {
+                `  fetch(request, env) {
+                `    return env.NS.get(env.NS.idFromName("ws")).fetch(request);
+                `  }
+                `}
+                `export class Actor extends DurableObject {
+                `  fetch(request) {
+                `    if (new URL(request.url).pathname === "/close") {
+                `      for (const ws of this.ctx.getWebSockets()) ws.close(4001, "bye");
+                `      return new Response("closed");
+                `    }
+                `    const pair = new WebSocketPair();
+                `    this.ctx.acceptWebSocket(pair[1]);
+                `    return new Response(null, {status: 101, webSocket: pair[0]});
+                `  }
+                `}
+          )],
+          bindings = [(name = "NS", durableObjectNamespace = "Actor")],
+          durableObjectNamespaces = [(className = "Actor", uniqueKey = "ws-drain")],
+          durableObjectStorage = (localDisk = "disk"),
+        )
+      ),
+      (name = "disk", disk = (path = "../../do-storage", writable = true)),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj);
+
+  test.root->openSubdir(kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE);
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  auto conn = test.connect("test-addr");
+  conn.upgradeToWebSocket();
+
+  {
+    auto control = test.connect("test-addr");
+    control.httpGet200("/close", "closed");
+  }
+  conn.recvWebSocketClose(4001);
+
+  // Hibernate the socket with its outgoing close sent but never echoed by the peer.
+  test.wait(11);
+
+  drain.fulfiller->fulfill();
+
+  // There is no second close frame to send, but the drain still has to tear the socket down so
+  // the connection ends without the client hanging up.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
+KJ_TEST("Server: drain leaves in-memory Durable Object WebSockets alone") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `export default {
+                `  fetch(request, env) {
+                `    return env.NS.get(env.NS.idFromName("ws")).fetch(request);
+                `  }
+                `}
+                `export class Actor extends DurableObject {
+                `  fetch(request) {
+                `    const pair = new WebSocketPair();
+                `    pair[1].accept();
+                `    return new Response(null, {status: 101, webSocket: pair[0]});
+                `  }
+                `}
+          )],
+          bindings = [(name = "NS", durableObjectNamespace = "Actor")],
+          durableObjectNamespaces = [(className = "Actor", uniqueKey = "ws-drain")],
+          durableObjectStorage = (inMemory = void),
+        )
+      ),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj);
+
+  auto drain = kj::newPromiseAndFulfiller<void>();
+  test.start(kj::mv(drain.promise));
+
+  {
+    auto conn = test.connect("test-addr");
+    conn.upgradeToWebSocket();
+
+    drain.fulfiller->fulfill();
+    KJ_EXPECT(!KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+
+    // In-memory namespaces hold no storage lease, so the drain leaves their WebSockets open;
+    // the connection only ends when the client goes away.
+    KJ_EXPECT_THROW_MESSAGE("No data available", conn.recvWebSocketClose(1001));
+  }
+
+  KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
+}
+
 // =======================================================================================
 // Test alternate service types
 //

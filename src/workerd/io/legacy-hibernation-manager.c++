@@ -241,6 +241,41 @@ kj::Maybe<uint32_t> LegacyHibernationManagerImpl::getEventTimeout() {
   return eventTimeoutMs;
 }
 
+kj::Promise<void> LegacyHibernationManagerImpl::closeAllForDrain(
+    uint16_t code, kj::StringPtr reason) {
+  // Cancel the read loops first: once the close frames go out, the peers' close echoes must not
+  // dispatch events, which would try to wake the actor against revoked storage.
+  readLoopTasks.clear();
+
+  kj::Vector<kj::Promise<void>> closes(allWs.size());
+  for (auto& hib: allWs) {
+    bool alreadyClosed = false;
+    KJ_IF_SOME(package, hib->activeOrPackage.tryGet<api::WebSocket::HibernationPackage>()) {
+      alreadyClosed = package.closedOutgoingConnection;
+    } else {
+      // An awake socket has a live api-layer pump; it is closed through the api instead.
+      continue;
+    }
+    KJ_IF_SOME(ws, hib->ws) {
+      hib->hasDispatchedClose = true;
+      auto& socket = *ws;
+      if (alreadyClosed) {
+        // The close frame went out back when JS closed the socket; only the teardown is left.
+        socket.abort();
+        continue;
+      }
+      auto reasonCopy = kj::str(reason);
+      // close() resolves once the frame is handed off, and a failure means the peer is already
+      // gone. Abort afterwards either way: with the read loops cancelled nobody would consume
+      // the peer's close echo, and an unread echo blocks the connection's reverse pump forever.
+      closes.add(
+          socket.close(code, reasonCopy).attach(kj::mv(reasonCopy)).catch_([](kj::Exception&&) {
+      }).then([&socket]() { socket.abort(); }));
+    }
+  }
+  return kj::joinPromises(closes.releaseAsArray()).attach(addRef());
+}
+
 void LegacyHibernationManagerImpl::dropHibernatableWebSocket(HibernatableWebSocket& hib) {
   removeFromAllWs(hib);
 }

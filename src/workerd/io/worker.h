@@ -52,6 +52,7 @@ struct CryptoAlgorithm;
 struct QueueExportedHandler;
 class WebSocket;
 class WebSocketRequestResponsePair;
+class WebSocketDrainRegistration;
 class CacheContext;
 class ExecutionContext;
 namespace pyodide {
@@ -896,6 +897,10 @@ class Worker::Actor final: public kj::Refcounted {
     virtual kj::Own<HibernationManager> addRef() = 0;
     virtual void setEventTimeout(kj::Maybe<uint32_t> timeoutMs) = 0;
     virtual kj::Maybe<uint32_t> getEventTimeout() = 0;
+
+    // Closes every hibernated WebSocket at the kj layer with the given close code, without
+    // dispatching any events or waking the actor; awake sockets are the api layer's to close.
+    virtual kj::Promise<void> closeAllForDrain(uint16_t code, kj::StringPtr reason) = 0;
   };
 
   class FacetManager {
@@ -1038,6 +1043,18 @@ class Worker::Actor final: public kj::Refcounted {
   // Set the HibernationManager for this actor. This is called once, on the first call to
   // `acceptWebSocket`.
   void setHibernationManager(kj::Own<HibernationManager> manager);
+
+  // Registers a WebSocket accepted while running in this actor, so a server drain can find and
+  // close it. The returned registration unlinks the socket when dropped.
+  kj::Own<api::WebSocketDrainRegistration> registerAcceptedWebSocket(api::WebSocket& shell);
+
+  // True if any registered WebSockets exist (registrations of closed sockets may linger until
+  // their shells are collected).
+  bool hasAcceptedWebSockets();
+
+  // Closes every registered WebSocket through the JS-facing close path. Must run inside this
+  // actor's IoContext with the isolate locked.
+  void drainCloseAcceptedWebSockets(jsg::Lock& js, int code, kj::StringPtr reason);
 
   // Gets the event type ID of the hibernation event, which is defined outside of workerd.
   // Only needs to be called when allocating a HibernationManager!

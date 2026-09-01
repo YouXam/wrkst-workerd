@@ -9,6 +9,7 @@
 #include <workerd/api/global-scope.h>
 #include <workerd/api/sockets.h>
 #include <workerd/api/streams/common.h>  // for api::StreamEncoding
+#include <workerd/api/web-socket.h>
 #include <workerd/io/actor-sqlite.h>
 #include <workerd/io/cdp.capnp.h>
 #include <workerd/io/compatibility-date.h>
@@ -3660,6 +3661,10 @@ struct Worker::Actor::Impl {
 
   kj::Own<ActorObserver> metrics;
 
+  // Refcounted: registrations owned by the sockets may outlive this actor.
+  kj::Own<api::WebSocketDrainRegistry> acceptedWebSockets =
+      kj::refcounted<api::WebSocketDrainRegistry>();
+
   // When a boolean, indicates whether a `transient` should exist. If true, it will be initialized
   // on the first `ensureConstructed()`.
   kj::OneOf<bool, jsg::JsRef<jsg::JsValue>> transient;
@@ -4405,6 +4410,19 @@ void Worker::Actor::setHibernationManager(kj::Own<HibernationManager> hib) {
   // Not the cleanest way to provide hibernation manager with a timer channel reference, but
   // where HibernationManager is constructed (actor-state), we don't have a timer channel ref.
   impl->hibernationManager = kj::mv(hib);
+}
+
+kj::Own<api::WebSocketDrainRegistration> Worker::Actor::registerAcceptedWebSocket(
+    api::WebSocket& shell) {
+  return impl->acceptedWebSockets->add(shell);
+}
+
+bool Worker::Actor::hasAcceptedWebSockets() {
+  return !impl->acceptedWebSockets->isEmpty();
+}
+
+void Worker::Actor::drainCloseAcceptedWebSockets(jsg::Lock& js, int code, kj::StringPtr reason) {
+  impl->acceptedWebSockets->closeAll(js, code, reason);
 }
 
 kj::Maybe<uint16_t> Worker::Actor::getHibernationEventType() {

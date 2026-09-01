@@ -14,6 +14,7 @@
 #include <workerd/util/strong-bool.h>
 
 #include <kj/compat/http.h>
+#include <kj/list.h>
 #include <kj/refcount.h>
 
 #include <cstdlib>
@@ -438,6 +439,43 @@ class WebSocket: public EventTarget {
       api::WebSocketPair::PairIterator::                                                           \
           Next  // The list of websocket.h types that are added to worker.c++'s JSG_DECLARE_ISOLATE_TYPE
 
+class WebSocketDrainRegistry;
+
+// A registry entry for one accepted WebSocket; the destructor unlinks it.
+class WebSocketDrainRegistration {
+ public:
+  WebSocketDrainRegistration(kj::Own<WebSocketDrainRegistry> registry, WebSocket& shell);
+  ~WebSocketDrainRegistration() noexcept(false);
+  KJ_DISALLOW_COPY_AND_MOVE(WebSocketDrainRegistration);
+
+ private:
+  kj::Own<WebSocketDrainRegistry> registry;
+  WebSocket& shell;
+  kj::ListLink<WebSocketDrainRegistration> link;
+
+  friend class WebSocketDrainRegistry;
+};
+
+// Tracks the WebSockets accepted while running in an actor. Refcounted because a registration
+// can outlive the actor that created the registry.
+class WebSocketDrainRegistry final: public kj::Refcounted {
+ public:
+  kj::Own<WebSocketDrainRegistration> add(WebSocket& shell);
+
+  // Closes every registered socket. Must run inside the owning actor's IoContext with the
+  // isolate locked.
+  void closeAll(jsg::Lock& js, int code, kj::StringPtr reason);
+
+  bool isEmpty() const {
+    return sockets.empty();
+  }
+
+ private:
+  kj::List<WebSocketDrainRegistration, &WebSocketDrainRegistration::link> sockets;
+
+  friend class WebSocketDrainRegistration;
+};
+
 // Abstract base for the operational implementation of an `api::WebSocket`.
 //
 // The eventual plan: `api::WebSocket` becomes a thin JSG-facing shell that owns a
@@ -840,6 +878,11 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   // within adapter coroutines (`jsg::_jsgThis(&shell)`). The shell strictly outlives
   // this adapter — the adapter is owned by `shell.impl`.
   WebSocket& shell;
+
+  // Present when the socket was accepted while running in an actor. Must die with the shell:
+  // the native state is deferred-deleted and can briefly outlive the shell this entry points
+  // back to. An entry for a socket that already closed is harmless — close() on it is a no-op.
+  kj::Maybe<kj::Own<WebSocketDrainRegistration>> drainRegistration;
 
   kj::Maybe<kj::String> url;
   kj::Maybe<kj::String> protocol = kj::String();

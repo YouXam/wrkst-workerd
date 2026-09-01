@@ -5,6 +5,7 @@ import os
 import queue
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -107,6 +108,20 @@ export class Counter extends DurableObject {
 
       case "/noop":
         return new Response("noop");
+
+      case "/ws-plain": {
+        const pair = new WebSocketPair();
+        pair[1].accept();
+        pair[1].send("ready");
+        return new Response(null, {status: 101, webSocket: pair[0]});
+      }
+
+      case "/ws-hibernatable": {
+        const pair = new WebSocketPair();
+        this.ctx.acceptWebSocket(pair[1]);
+        pair[1].send("ready");
+        return new Response(null, {status: 101, webSocket: pair[0]});
+      }
 
       default:
         return new Response("not found", {status: 404});
@@ -297,6 +312,77 @@ def request(port, path, timeout=10):
         connection.close()
 
 
+class WebSocketClient:
+    """A minimal RFC 6455 client: handshake plus unfragmented frame reads."""
+
+    def __init__(self, port, path, timeout=10):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        self.buffer = b""
+        self.sock.sendall(
+            (
+                f"GET {path} HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "\r\n"
+            ).encode()
+        )
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise AssertionError("connection closed during websocket handshake")
+            response += chunk
+        head, self.buffer = response.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0]
+        if b" 101 " not in status + b" ":
+            raise AssertionError(f"websocket handshake failed: {head!r}")
+
+    def _read_exact(self, count):
+        while len(self.buffer) < count:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise AssertionError("connection closed mid-frame")
+            self.buffer += chunk
+        data, self.buffer = self.buffer[:count], self.buffer[count:]
+        return data
+
+    def read_frame(self, timeout):
+        self.sock.settimeout(timeout)
+        header = self._read_exact(2)
+        opcode = header[0] & 0x0F
+        length = header[1] & 0x7F
+        if length == 126:
+            length = int.from_bytes(self._read_exact(2), "big")
+        elif length == 127:
+            length = int.from_bytes(self._read_exact(8), "big")
+        # Server-to-client frames are never masked.
+        return opcode, self._read_exact(length)
+
+    def expect_text(self, expected, timeout=10):
+        opcode, payload = self.read_frame(timeout)
+        if opcode != 1 or payload.decode() != expected:
+            raise AssertionError(
+                f"expected text {expected!r}, got {opcode}/{payload!r}"
+            )
+
+    def expect_close(self, expected_code, timeout=10):
+        opcode, payload = self.read_frame(timeout)
+        if opcode != 8:
+            raise AssertionError(f"expected close frame, got {opcode}/{payload!r}")
+        code = int.from_bytes(payload[:2], "big")
+        if code != expected_code:
+            raise AssertionError(f"expected close code {expected_code}, got {code}")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 class StorageHandoffTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -401,6 +487,39 @@ class StorageHandoffTest(unittest.TestCase):
         self.assertEqual(old.wait(timeout=5), -signal.SIGKILL)
         self.assertEqual(self.coordinator.entered.get(timeout=5), "new")
         self.assertEqual(self.future_result(increment, new), "1")
+
+    def test_sigterm_closes_actor_websockets(self):
+        old = self.start_workerd("old")
+        plain = WebSocketClient(old.port, "/ws-plain")
+        hibernatable = WebSocketClient(old.port, "/ws-hibernatable")
+        try:
+            plain.expect_text("ready")
+            hibernatable.expect_text("ready")
+
+            new = self.start_workerd("new")
+            increment = self.executor.submit(request, new.port, "/increment")
+            self.assert_queue_empty(self.coordinator.entered)
+            self.assertFalse(increment.done())
+
+            old.send_signal(signal.SIGTERM)
+            plain.expect_close(1001, timeout=5)
+            hibernatable.expect_close(1001, timeout=5)
+
+            # The successor acquires the lease and writes while the old process is still up.
+            self.assertEqual(self.coordinator.entered.get(timeout=5), "new")
+            self.assertEqual(self.future_result(increment, new), "1")
+        finally:
+            # Dropping the connections lets the old process finish its drain. (A client that
+            # echoes the close instead hits a pre-existing teardown gap in the hibernatable
+            # close-event path that leaves the connection undrainable; wrkst bounds that case
+            # with its own connection cutoff.)
+            plain.close()
+            hibernatable.close()
+
+        self.assertEqual(old.wait(timeout=10), 0, old.read_stderr())
+
+        new.send_signal(signal.SIGTERM)
+        self.assertEqual(new.wait(timeout=10), 0, new.read_stderr())
 
 
 if __name__ == "__main__":

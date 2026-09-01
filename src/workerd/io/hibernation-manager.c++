@@ -58,4 +58,8 @@ kj::Maybe<uint32_t> HibernationManagerImpl::getEventTimeout() {
   KJ_UNIMPLEMENTED("HibernationManagerImpl::getEventTimeout not yet implemented (EW-10817)");
 }
 
+kj::Promise<void> HibernationManagerImpl::closeAllForDrain(uint16_t code, kj::StringPtr reason) {
+  KJ_UNIMPLEMENTED("HibernationManagerImpl::closeAllForDrain not yet implemented (EW-10817)");
+}
+
 }  // namespace workerd

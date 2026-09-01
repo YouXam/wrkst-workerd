@@ -54,6 +54,8 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
   // Gets the event timeout if set.
   kj::Maybe<uint32_t> getEventTimeout() override;
 
+  kj::Promise<void> closeAllForDrain(uint16_t code, kj::StringPtr reason) override;
+
  private:
   class HibernatableWebSocket;
 

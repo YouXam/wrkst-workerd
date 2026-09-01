@@ -31,6 +31,7 @@ class HibernationManagerImpl final: public Worker::Actor::HibernationManager {
   kj::Own<HibernationManager> addRef() override;
   void setEventTimeout(kj::Maybe<uint32_t> timeoutMs) override;
   kj::Maybe<uint32_t> getEventTimeout() override;
+  kj::Promise<void> closeAllForDrain(uint16_t code, kj::StringPtr reason) override;
 };
 
 }  // namespace workerd
