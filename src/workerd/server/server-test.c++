@@ -6118,6 +6118,62 @@ KJ_TEST("Server: drain closes hibernated WebSockets without waking the actor") {
   KJ_EXPECT(KJ_ASSERT_NONNULL(test.runTask).poll(test.ws));
 }
 
+KJ_TEST("Server: hibernatable close handshake releases the connection") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [(
+            name = "worker.js",
+            esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `export default {
+                `  fetch(request, env) {
+                `    return env.NS.get(env.NS.idFromName("ws")).fetch(request);
+                `  }
+                `}
+                `export class Actor extends DurableObject {
+                `  fetch(request) {
+                `    if (new URL(request.url).pathname === "/close") {
+                `      for (const ws of this.ctx.getWebSockets()) ws.close(4001, "bye");
+                `      return new Response("closed");
+                `    }
+                `    const pair = new WebSocketPair();
+                `    this.ctx.acceptWebSocket(pair[1]);
+                `    return new Response(null, {status: 101, webSocket: pair[0]});
+                `  }
+                `}
+          )],
+          bindings = [(name = "NS", durableObjectNamespace = "Actor")],
+          durableObjectNamespaces = [(className = "Actor", uniqueKey = "ws-drain")],
+          durableObjectStorage = (inMemory = void),
+        )
+      ),
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "hello")],
+  ))"_kj);
+
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.upgradeToWebSocket();
+
+  {
+    auto control = test.connect("test-addr");
+    control.httpGet200("/close", "closed");
+  }
+  conn.recvWebSocketClose(4001);
+
+  // Echo the close to finish the handshake; the mask flag is set with a zero key.
+  static constexpr kj::byte closeEcho[] = {0x88, 0x82, 0, 0, 0, 0, 0x0f, 0xa1};
+  conn.getStream().write(closeEcho).wait(test.ws);
+
+  // With the handshake complete in both directions, the server side must let go of the
+  // underlying socket and close the connection without waiting for the client to hang up.
+  KJ_EXPECT(conn.isEof());
+}
+
 KJ_TEST("Server: drain aborts hibernated WebSockets that were already closed") {
   TestServer test(R"((
     services = [

@@ -1579,6 +1579,7 @@ void LegacyWebSocketAdapter::initiateHibernatableRelease(
         "tried to initiate hibernatable release but websocket wasn't hibernatable");
     state.ws.initiateHibernatableRelease(js, kj::mv(tags), releaseState);
     farNative->closedIncoming = true;
+    tryReleaseNative(js);
   } else {
     KJ_LOG(WARNING, "Unexpected Hibernatable WebSocket state on release", farNative->state);
   }

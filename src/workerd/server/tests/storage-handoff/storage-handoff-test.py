@@ -376,6 +376,17 @@ class WebSocketClient:
         if code != expected_code:
             raise AssertionError(f"expected close code {expected_code}, got {code}")
 
+    def send_close(self, code=1001):
+        # Client frames must be masked; a zero key leaves the payload bytes unchanged.
+        payload = code.to_bytes(2, "big")
+        self.sock.sendall(bytes([0x88, 0x80 | len(payload), 0, 0, 0, 0]) + payload)
+
+    def expect_eof(self, timeout=10):
+        self.sock.settimeout(timeout)
+        leftover = self.buffer or self.sock.recv(4096)
+        if leftover:
+            raise AssertionError(f"expected EOF, got {leftover!r}")
+
     def close(self):
         try:
             self.sock.close()
@@ -508,15 +519,17 @@ class StorageHandoffTest(unittest.TestCase):
             # The successor acquires the lease and writes while the old process is still up.
             self.assertEqual(self.coordinator.entered.get(timeout=5), "new")
             self.assertEqual(self.future_result(increment, new), "1")
+
+            # A conforming client echoes the close and waits for the server to hang up first;
+            # the old process must finish its drain and exit without anyone dropping TCP.
+            plain.send_close()
+            hibernatable.send_close()
+            plain.expect_eof()
+            hibernatable.expect_eof()
+            self.assertEqual(old.wait(timeout=10), 0, old.read_stderr())
         finally:
-            # Dropping the connections lets the old process finish its drain. (A client that
-            # echoes the close instead hits a pre-existing teardown gap in the hibernatable
-            # close-event path that leaves the connection undrainable; wrkst bounds that case
-            # with its own connection cutoff.)
             plain.close()
             hibernatable.close()
-
-        self.assertEqual(old.wait(timeout=10), 0, old.read_stderr())
 
         new.send_signal(signal.SIGTERM)
         self.assertEqual(new.wait(timeout=10), 0, new.read_stderr())
