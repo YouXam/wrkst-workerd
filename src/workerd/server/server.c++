@@ -6052,13 +6052,6 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
     }
 
     case config::Worker::Binding::WORKER_LOADER: {
-      if (!experimental) {
-        errorReporter.addError(kj::str(
-            "Worker loader bindings are an experimental feature which may change or go away "
-            "in the future. You must run workerd with `--experimental` to use this feature."));
-        return kj::none;
-      }
-
       auto loaderConf = binding.getWorkerLoader();
 
       FutureWorkerLoaderChannel channel;
